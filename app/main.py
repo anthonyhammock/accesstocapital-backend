@@ -19,13 +19,13 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
-        "https://accesstocapital-web.vercel.app"
+        "https://accesstocapital-web.vercel.app",
     ],
+    allow_origin_regex=r"https://accesstocapital.*\.vercel\.app$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 # Password hashing setup
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
