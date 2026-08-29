@@ -11,3 +11,7 @@ google-cloud-secret-manager==2.16.4
 python-jose==3.3.0
 passlib==1.7.4
 python-multipart==0.0.6
+psycopg2-binary
+passlib
+bcrypt
+pydantic[email]
