@@ -306,6 +306,168 @@ async def get_user(user_id: int):
         cur.close()
         conn.close()
 
+# ===== CONSUMER ACCOUNTS =====
+
+class ConsumerAccountCreate(BaseModel):
+    user_id: int
+    account_name: str
+    credit_limit: float = None
+
+@app.post("/api/consumer-accounts")
+async def create_consumer_account(account: ConsumerAccountCreate):
+    """
+    Create a new consumer credit account
+    
+    Expects:
+    {
+      "user_id": 1,
+      "account_name": "Chase Sapphire Preferred",
+      "credit_limit": 10000
+    }
+    """
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database error")
+    
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        # Verify user exists
+        cur.execute("SELECT id FROM users WHERE id = %s", (account.user_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Create account
+        cur.execute("""
+            INSERT INTO consumer_accounts 
+            (user_id, account_name, credit_limit, current_balance, payment_status)
+            VALUES (%s, %s, %s, 0, 'current')
+            RETURNING id, account_name, credit_limit, current_balance, created_at
+        """, (account.user_id, account.account_name, account.credit_limit))
+        
+        account = cur.fetchone()
+        conn.commit()
+        
+        return {
+            "message": "Consumer account created",
+            "account": account,
+            "status": "success"
+        }
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+@app.get("/api/consumer-accounts")
+async def get_consumer_accounts(user_id: int):
+    """Get all consumer accounts for a user"""
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database error")
+    
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        cur.execute("""
+            SELECT id, account_name, credit_limit, current_balance, payment_status, created_at
+            FROM consumer_accounts
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+        """, (user_id,))
+        
+        accounts = cur.fetchall()
+        
+        return {
+            "accounts": accounts,
+            "total": len(accounts),
+            "status": "success"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+# ===== BUSINESS ACCOUNTS =====
+
+class BusinessAccountCreate(BaseModel):
+    user_id: int
+    business_name: str
+    ein: str = None
+    credit_limit: float = None
+
+@app.post("/api/business-accounts")
+async def create_business_account(account: BusinessAccountCreate):
+    """
+    Create a new business credit account
+    """
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database error")
+    
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        # Verify user exists
+        cur.execute("SELECT id FROM users WHERE id = %s", (account.user_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Create account
+        cur.execute("""
+            INSERT INTO business_accounts 
+            (user_id, business_name, ein, credit_limit, current_balance)
+            VALUES (%s, %s, %s, %s, 0)
+            RETURNING id, business_name, ein, credit_limit, current_balance, created_at
+        """, (account.user_id, account.business_name, account.ein, account.credit_limit))
+        
+        account = cur.fetchone()
+        conn.commit()
+        
+        return {
+            "message": "Business account created",
+            "account": account,
+            "status": "success"
+        }
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+@app.get("/api/business-accounts")
+async def get_business_accounts(user_id: int):
+    """Get all business accounts for a user"""
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database error")
+    
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        cur.execute("""
+            SELECT id, business_name, ein, credit_limit, current_balance, created_at
+            FROM business_accounts
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+        """, (user_id,))
+        
+        accounts = cur.fetchall()
+        
+        return {
+            "accounts": accounts,
+            "total": len(accounts),
+            "status": "success"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cur.close()
+        conn.close()
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
