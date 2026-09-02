@@ -11,15 +11,17 @@ from datetime import datetime
 import os
 import re
 
+# Import database and models
 from app.database import get_db, engine
-from app.models import Base, DeductionRule, CategorizationRule, Transaction, TaxSummary, CreditAccount, PaymentHistory
+from app.models import Base, DeductionRule, CategorizationRule, Transaction, TaxSummary
 
-# Create tables
+# Create tables on startup
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="BlissPoint - Tax & Credit Builder", version="1.0.0")
+# Initialize app
+app = FastAPI(title="BlissPoint Tax & Credit", version="1.0.0")
 
-# CORS Configuration
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -46,30 +48,30 @@ class CalculationRequest(BaseModel):
     user_id: int
     tax_year: int
     entity_type: str
-    transactions: list[TransactionInput]
+    transactions: list = []
     officer_wages: Decimal = Decimal(0)
 
 # ============================================
-# TAX ENGINE FUNCTIONS
+# HELPER FUNCTIONS
 # ============================================
 
-def categorize_transaction(merchant: str, db: Session) -> dict:
-    """Match merchant to deduction using rules"""
+def categorize_merchant(merchant: str, db: Session) -> dict:
+    """Match merchant name to deduction code"""
     
-    # Try exact vendor match first
-    exact_rule = db.query(CategorizationRule).filter(
-        CategorizationRule.rule_type == 'exact_vendor',
-        CategorizationRule.rule_value.ilike(f"%{merchant}%")
-    ).order_by(CategorizationRule.priority).first()
+    # Try exact match
+    exact = db.query(CategorizationRule).filter(
+        CategorizationRule.rule_type == 'exact_vendor'
+    ).order_by(CategorizationRule.priority).all()
     
-    if exact_rule:
-        return {
-            'deduction_code': exact_rule.deduction_code,
-            'confidence': 0.95,
-            'matched_by': 'exact_vendor'
-        }
+    for rule in exact:
+        if rule.rule_value.upper() in merchant.upper():
+            return {
+                'code': rule.deduction_code,
+                'confidence': 0.95,
+                'method': 'exact'
+            }
     
-    # Try regex patterns
+    # Try regex
     regex_rules = db.query(CategorizationRule).filter(
         CategorizationRule.rule_type == 'regex_pattern'
     ).order_by(CategorizationRule.priority).all()
@@ -78,19 +80,14 @@ def categorize_transaction(merchant: str, db: Session) -> dict:
         try:
             if re.search(rule.rule_value, merchant, re.IGNORECASE):
                 return {
-                    'deduction_code': rule.deduction_code,
+                    'code': rule.deduction_code,
                     'confidence': 0.80,
-                    'matched_by': 'regex'
+                    'method': 'regex'
                 }
         except:
             pass
     
-    # No match
-    return {
-        'deduction_code': None,
-        'confidence': 0,
-        'matched_by': 'none'
-    }
+    return {'code': None, 'confidence': 0, 'method': 'none'}
 
 # ============================================
 # TAX ENDPOINTS
@@ -102,27 +99,34 @@ async def upload_csv(
     file: UploadFile = File(...),
     db: Session = Depends(get_db)
 ):
-    """Upload bank CSV and categorize transactions"""
+    """Upload and categorize bank CSV"""
     
     try:
         contents = await file.read()
-        csv_reader = csv.DictReader(io.StringIO(contents.decode('utf-8')))
+        text_io = io.StringIO(contents.decode('utf-8'))
+        reader = csv.DictReader(text_io)
         
-        transactions_list = []
-        for row in csv_reader:
+        if not reader.fieldnames:
+            raise ValueError("CSV is empty")
+        
+        transactions = []
+        for row_num, row in enumerate(reader, start=2):
             try:
-                # Generic CSV parsing (Date, Description, Amount)
+                # Parse CSV
                 merchant = row.get('Description') or row.get('Merchant') or 'Unknown'
                 amount_str = row.get('Amount') or row.get('amount') or '0'
-                date_str = row.get('Date') or row.get('date') or '2026-01-01'
+                date_str = row.get('Date') or row.get('date') or ''
                 
-                # Parse amount
+                # Amount
                 try:
-                    amount = Decimal(amount_str.replace('$', '').replace(',', ''))
+                    amount = Decimal(str(amount_str).replace('$', '').replace(',', ''))
                 except:
-                    amount = Decimal(0)
+                    amount = Decimal('0')
                 
-                # Parse date (multiple formats)
+                if amount == 0:
+                    continue
+                
+                # Date
                 try:
                     tx_date = datetime.strptime(date_str, '%m/%d/%Y').date()
                 except:
@@ -132,39 +136,40 @@ async def upload_csv(
                         tx_date = datetime.now().date()
                 
                 # Categorize
-                category_result = categorize_transaction(merchant, db)
+                cat = categorize_merchant(merchant, db)
                 
-                # Create transaction
+                # Save
                 tx = Transaction(
                     user_id=user_id,
                     merchant_name=merchant,
                     amount=amount,
                     transaction_date=tx_date,
-                    deduction_code=category_result.get('deduction_code'),
-                    category=category_result.get('matched_by'),
-                    confidence_score=category_result.get('confidence')
+                    deduction_code=cat.get('code'),
+                    category=cat.get('method'),
+                    confidence_score=cat.get('confidence')
                 )
                 db.add(tx)
-                transactions_list.append(tx)
+                transactions.append(tx)
+            
             except Exception as e:
-                print(f"Error parsing row: {e}")
+                print(f"Row {row_num} error: {e}")
                 continue
         
         db.commit()
         
         return {
             'status': 'success',
-            'transactions_uploaded': len(transactions_list),
+            'count': len(transactions),
             'transactions': [
                 {
                     'id': t.id,
-                    'date': t.transaction_date.strftime('%Y-%m-%d'),
+                    'date': t.transaction_date.strftime('%Y-%m-%d') if t.transaction_date else '',
                     'merchant': t.merchant_name,
                     'amount': float(t.amount),
                     'category': t.category,
                     'confidence': t.confidence_score
                 }
-                for t in transactions_list
+                for t in transactions[:50]
             ]
         }
     
@@ -173,24 +178,23 @@ async def upload_csv(
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/api/tax/calculate-deductions")
-async def calculate_deductions(payload: CalculationRequest, db: Session = Depends(get_db)):
-    """Calculate deductions and map to form lines"""
+async def calculate(payload: CalculationRequest, db: Session = Depends(get_db)):
+    """Calculate deductions for user"""
     
     try:
-        # Get all transactions for user
-        transactions = db.query(Transaction).filter(
+        # Get user's transactions
+        txs = db.query(Transaction).filter(
             Transaction.user_id == payload.user_id
         ).all()
         
-        total_deductions = Decimal(0)
-        form_breakdown = {}
-        deduction_details = []
+        total = Decimal(0)
+        lines = {}
+        details = []
         
-        for tx in transactions:
+        for tx in txs:
             if not tx.deduction_code:
                 continue
             
-            # Get deduction rule
             rule = db.query(DeductionRule).filter(
                 DeductionRule.deduction_code == tx.deduction_code
             ).first()
@@ -198,64 +202,51 @@ async def calculate_deductions(payload: CalculationRequest, db: Session = Depend
             if not rule:
                 continue
             
-            # Apply IRC rules
-            deductible = tx.amount
-            limitation = None
+            # Calculate
+            amount = tx.amount
+            limit = None
             
-            # 50% meals limitation
             if rule.meals_50_percent:
-                deductible = tx.amount * Decimal('0.50')
-                limitation = "50% meals limitation"
+                amount = tx.amount * Decimal('0.50')
+                limit = '50% meals'
             
-            total_deductions += deductible
+            total += amount
             
-            # Map to form line
+            # Form line
             if payload.entity_type == 'SOLE_PROP':
-                form_line = rule.form_mapping_sole_prop
+                line = rule.form_mapping_sole_prop
             elif payload.entity_type == 'S_CORP':
-                form_line = rule.form_mapping_s_corp
+                line = rule.form_mapping_s_corp
             else:
-                form_line = rule.form_mapping_c_corp
+                line = rule.form_mapping_c_corp
             
-            if form_line not in form_breakdown:
-                form_breakdown[form_line] = {
-                    'total': Decimal(0),
-                    'transactions': []
-                }
+            if line not in lines:
+                lines[line] = {'total': Decimal(0), 'count': 0}
             
-            form_breakdown[form_line]['total'] += deductible
-            form_breakdown[form_line]['transactions'].append({
+            lines[line]['total'] += amount
+            lines[line]['count'] += 1
+            
+            details.append({
                 'merchant': tx.merchant_name,
-                'amount': float(tx.amount),
-                'deductible': float(deductible),
-                'limitation': limitation
-            })
-            
-            deduction_details.append({
-                'merchant': tx.merchant_name,
-                'code': tx.deduction_code,
-                'amount': float(tx.amount),
-                'deductible': float(deductible),
-                'form_line': form_line,
-                'limitation': limitation
+                'original': float(tx.amount),
+                'deductible': float(amount),
+                'limit': limit,
+                'line': line
             })
         
-        # Add officer wages (S/C corp)
-        if payload.entity_type in ['S_CORP', 'C_CORP'] and payload.officer_wages > 0:
-            officer_form = 'Form 1120-S Line 7' if payload.entity_type == 'S_CORP' else 'Form 1120 Line 12'
-            total_deductions += payload.officer_wages
-            form_breakdown[officer_form] = {
-                'total': payload.officer_wages,
-                'transactions': [{'description': 'Officer Wages'}]
-            }
+        # Officer wages
+        if payload.entity_type != 'SOLE_PROP' and payload.officer_wages > 0:
+            total += payload.officer_wages
+            line = 'Form 1120-S Line 7' if payload.entity_type == 'S_CORP' else 'Form 1120 Line 12'
+            lines[line] = {'total': payload.officer_wages, 'count': 1}
         
-        # Save summary
+        # Save
         summary = TaxSummary(
             user_id=payload.user_id,
             tax_year=payload.tax_year,
             entity_type=payload.entity_type,
-            total_deductions=total_deductions,
-            form_line_breakdown=json.dumps({k: {'total': float(v['total'])} for k, v in form_breakdown.items()}),
+            total_deductions=total,
+            form_line_breakdown=json.dumps({k: float(v['total']) for k, v in lines.items()}),
             status='draft'
         )
         db.add(summary)
@@ -263,15 +254,9 @@ async def calculate_deductions(payload: CalculationRequest, db: Session = Depend
         
         return {
             'status': 'success',
-            'tax_year': payload.tax_year,
-            'entity_type': payload.entity_type,
-            'total_deductions': float(total_deductions),
-            'transaction_count': len(transactions),
-            'form_line_breakdown': {
-                k: {'total': float(v['total']), 'count': len(v['transactions'])}
-                for k, v in form_breakdown.items()
-            },
-            'deduction_details': deduction_details
+            'total': float(total),
+            'lines': {k: {'total': float(v['total']), 'count': v['count']} for k, v in lines.items()},
+            'details': details[:20]
         }
     
     except Exception as e:
@@ -279,68 +264,18 @@ async def calculate_deductions(payload: CalculationRequest, db: Session = Depend
         raise HTTPException(status_code=400, detail=str(e))
 
 # ============================================
-# CREDIT-BUILDER ENDPOINTS
-# ============================================
-
-@app.post("/api/credit-builder/accounts/create")
-async def create_credit_account(
-    user_id: int,
-    account_type: str,
-    deposit_amount: Decimal,
-    monthly_payment: Decimal,
-    term_months: int,
-    db: Session = Depends(get_db)
-):
-    """Create credit-builder account"""
-    
-    try:
-        account = CreditAccount(
-            user_id=user_id,
-            account_type=account_type,
-            deposit_amount=deposit_amount,
-            monthly_payment=monthly_payment,
-            term_months=term_months,
-            current_balance=deposit_amount,
-            status='active'
-        )
-        db.add(account)
-        db.commit()
-        db.refresh(account)
-        
-        return {
-            'status': 'success',
-            'account_id': account.id,
-            'deposit_amount': float(deposit_amount),
-            'monthly_payment': float(monthly_payment),
-            'term_months': term_months,
-            'account_type': account_type
-        }
-    
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
-
-# ============================================
-# HEALTH ENDPOINTS
+# HEALTH
 # ============================================
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "blisspoint-tax-credit"}
+    return {"ok": True}
 
 @app.get("/health/ready")
 async def ready(db: Session = Depends(get_db)):
     try:
-        # Test database
         db.execute(text("SELECT 1"))
-        
-        # Count deductions
-        deduction_count = db.query(DeductionRule).count()
-        
-        return {
-            "status": "ready",
-            "database": "connected",
-            "deductions_loaded": deduction_count
-        }
-    except:
-        raise HTTPException(status_code=503, detail="Database not connected")
+        count = db.query(DeductionRule).count()
+        return {"ready": True, "deductions": count}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=str(e))
