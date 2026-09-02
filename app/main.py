@@ -1,20 +1,25 @@
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
-from passlib.context import CryptContext
-import psycopg2
-from psycopg2.extras import RealDictCursor
-import os
+from sqlalchemy.orm import Session
+from sqlalchemy import text
+from pydantic import BaseModel
+from decimal import Decimal
+import csv
+import io
+import json
 from datetime import datetime
+import os
+import re
 
-# Initialize FastAPI app
-app = FastAPI(
-    title="Access to Capital API",
-    version="1.0.0",
-    description="Credit reporting platform API"
-)
+from app.database import get_db, engine
+from app.models import Base, DeductionRule, CategorizationRule, Transaction, TaxSummary, CreditAccount, PaymentHistory
 
-# Enable CORS
+# Create tables
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(title="BlissPoint - Tax & Credit Builder", version="1.0.0")
+
+# CORS Configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -26,448 +31,316 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# Password hashing setup
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# Database connection
-def get_db_connection():
-    """Connect to Google Cloud SQL"""
+# ============================================
+# PYDANTIC MODELS
+# ============================================
+
+class TransactionInput(BaseModel):
+    merchant_name: str
+    amount: Decimal
+    transaction_date: str
+    deduction_code: str = None
+
+class CalculationRequest(BaseModel):
+    user_id: int
+    tax_year: int
+    entity_type: str
+    transactions: list[TransactionInput]
+    officer_wages: Decimal = Decimal(0)
+
+# ============================================
+# TAX ENGINE FUNCTIONS
+# ============================================
+
+def categorize_transaction(merchant: str, db: Session) -> dict:
+    """Match merchant to deduction using rules"""
+    
+    # Try exact vendor match first
+    exact_rule = db.query(CategorizationRule).filter(
+        CategorizationRule.rule_type == 'exact_vendor',
+        CategorizationRule.rule_value.ilike(f"%{merchant}%")
+    ).order_by(CategorizationRule.priority).first()
+    
+    if exact_rule:
+        return {
+            'deduction_code': exact_rule.deduction_code,
+            'confidence': 0.95,
+            'matched_by': 'exact_vendor'
+        }
+    
+    # Try regex patterns
+    regex_rules = db.query(CategorizationRule).filter(
+        CategorizationRule.rule_type == 'regex_pattern'
+    ).order_by(CategorizationRule.priority).all()
+    
+    for rule in regex_rules:
+        try:
+            if re.search(rule.rule_value, merchant, re.IGNORECASE):
+                return {
+                    'deduction_code': rule.deduction_code,
+                    'confidence': 0.80,
+                    'matched_by': 'regex'
+                }
+        except:
+            pass
+    
+    # No match
+    return {
+        'deduction_code': None,
+        'confidence': 0,
+        'matched_by': 'none'
+    }
+
+# ============================================
+# TAX ENDPOINTS
+# ============================================
+
+@app.post("/api/tax/upload-csv")
+async def upload_csv(
+    user_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db)
+):
+    """Upload bank CSV and categorize transactions"""
+    
     try:
-        conn = psycopg2.connect(
-            host=os.getenv("DB_HOST", "localhost"),
-            database=os.getenv("DB_NAME", "postgres"),
-            user=os.getenv("DB_USER", "postgres"),
-            password=os.getenv("DB_PASSWORD", ""),
-            port=os.getenv("DB_PORT", "5432")
-        )
-        return conn
+        contents = await file.read()
+        csv_reader = csv.DictReader(io.StringIO(contents.decode('utf-8')))
+        
+        transactions_list = []
+        for row in csv_reader:
+            try:
+                # Generic CSV parsing (Date, Description, Amount)
+                merchant = row.get('Description') or row.get('Merchant') or 'Unknown'
+                amount_str = row.get('Amount') or row.get('amount') or '0'
+                date_str = row.get('Date') or row.get('date') or '2026-01-01'
+                
+                # Parse amount
+                try:
+                    amount = Decimal(amount_str.replace('$', '').replace(',', ''))
+                except:
+                    amount = Decimal(0)
+                
+                # Parse date (multiple formats)
+                try:
+                    tx_date = datetime.strptime(date_str, '%m/%d/%Y').date()
+                except:
+                    try:
+                        tx_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+                    except:
+                        tx_date = datetime.now().date()
+                
+                # Categorize
+                category_result = categorize_transaction(merchant, db)
+                
+                # Create transaction
+                tx = Transaction(
+                    user_id=user_id,
+                    merchant_name=merchant,
+                    amount=amount,
+                    transaction_date=tx_date,
+                    deduction_code=category_result.get('deduction_code'),
+                    category=category_result.get('matched_by'),
+                    confidence_score=category_result.get('confidence')
+                )
+                db.add(tx)
+                transactions_list.append(tx)
+            except Exception as e:
+                print(f"Error parsing row: {e}")
+                continue
+        
+        db.commit()
+        
+        return {
+            'status': 'success',
+            'transactions_uploaded': len(transactions_list),
+            'transactions': [
+                {
+                    'id': t.id,
+                    'date': t.transaction_date.strftime('%Y-%m-%d'),
+                    'merchant': t.merchant_name,
+                    'amount': float(t.amount),
+                    'category': t.category,
+                    'confidence': t.confidence_score
+                }
+                for t in transactions_list
+            ]
+        }
+    
     except Exception as e:
-        print(f"Database connection error: {e}")
-        return None
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
 
-# ===== DATA MODELS =====
+@app.post("/api/tax/calculate-deductions")
+async def calculate_deductions(payload: CalculationRequest, db: Session = Depends(get_db)):
+    """Calculate deductions and map to form lines"""
+    
+    try:
+        # Get all transactions for user
+        transactions = db.query(Transaction).filter(
+            Transaction.user_id == payload.user_id
+        ).all()
+        
+        total_deductions = Decimal(0)
+        form_breakdown = {}
+        deduction_details = []
+        
+        for tx in transactions:
+            if not tx.deduction_code:
+                continue
+            
+            # Get deduction rule
+            rule = db.query(DeductionRule).filter(
+                DeductionRule.deduction_code == tx.deduction_code
+            ).first()
+            
+            if not rule:
+                continue
+            
+            # Apply IRC rules
+            deductible = tx.amount
+            limitation = None
+            
+            # 50% meals limitation
+            if rule.meals_50_percent:
+                deductible = tx.amount * Decimal('0.50')
+                limitation = "50% meals limitation"
+            
+            total_deductions += deductible
+            
+            # Map to form line
+            if payload.entity_type == 'SOLE_PROP':
+                form_line = rule.form_mapping_sole_prop
+            elif payload.entity_type == 'S_CORP':
+                form_line = rule.form_mapping_s_corp
+            else:
+                form_line = rule.form_mapping_c_corp
+            
+            if form_line not in form_breakdown:
+                form_breakdown[form_line] = {
+                    'total': Decimal(0),
+                    'transactions': []
+                }
+            
+            form_breakdown[form_line]['total'] += deductible
+            form_breakdown[form_line]['transactions'].append({
+                'merchant': tx.merchant_name,
+                'amount': float(tx.amount),
+                'deductible': float(deductible),
+                'limitation': limitation
+            })
+            
+            deduction_details.append({
+                'merchant': tx.merchant_name,
+                'code': tx.deduction_code,
+                'amount': float(tx.amount),
+                'deductible': float(deductible),
+                'form_line': form_line,
+                'limitation': limitation
+            })
+        
+        # Add officer wages (S/C corp)
+        if payload.entity_type in ['S_CORP', 'C_CORP'] and payload.officer_wages > 0:
+            officer_form = 'Form 1120-S Line 7' if payload.entity_type == 'S_CORP' else 'Form 1120 Line 12'
+            total_deductions += payload.officer_wages
+            form_breakdown[officer_form] = {
+                'total': payload.officer_wages,
+                'transactions': [{'description': 'Officer Wages'}]
+            }
+        
+        # Save summary
+        summary = TaxSummary(
+            user_id=payload.user_id,
+            tax_year=payload.tax_year,
+            entity_type=payload.entity_type,
+            total_deductions=total_deductions,
+            form_line_breakdown=json.dumps({k: {'total': float(v['total'])} for k, v in form_breakdown.items()}),
+            status='draft'
+        )
+        db.add(summary)
+        db.commit()
+        
+        return {
+            'status': 'success',
+            'tax_year': payload.tax_year,
+            'entity_type': payload.entity_type,
+            'total_deductions': float(total_deductions),
+            'transaction_count': len(transactions),
+            'form_line_breakdown': {
+                k: {'total': float(v['total']), 'count': len(v['transactions'])}
+                for k, v in form_breakdown.items()
+            },
+            'deduction_details': deduction_details
+        }
+    
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
 
-class UserRegister(BaseModel):
-    """Data model for user registration"""
-    email: EmailStr
-    password: str
-    first_name: str
-    last_name: str
-    account_type: str  # 'consumer' or 'business'
+# ============================================
+# CREDIT-BUILDER ENDPOINTS
+# ============================================
 
-class UserLogin(BaseModel):
-    """Data model for user login"""
-    email: str
-    password: str
+@app.post("/api/credit-builder/accounts/create")
+async def create_credit_account(
+    user_id: int,
+    account_type: str,
+    deposit_amount: Decimal,
+    monthly_payment: Decimal,
+    term_months: int,
+    db: Session = Depends(get_db)
+):
+    """Create credit-builder account"""
+    
+    try:
+        account = CreditAccount(
+            user_id=user_id,
+            account_type=account_type,
+            deposit_amount=deposit_amount,
+            monthly_payment=monthly_payment,
+            term_months=term_months,
+            current_balance=deposit_amount,
+            status='active'
+        )
+        db.add(account)
+        db.commit()
+        db.refresh(account)
+        
+        return {
+            'status': 'success',
+            'account_id': account.id,
+            'deposit_amount': float(deposit_amount),
+            'monthly_payment': float(monthly_payment),
+            'term_months': term_months,
+            'account_type': account_type
+        }
+    
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
 
-class UserResponse(BaseModel):
-    """User data to return (no password)"""
-    id: int
-    email: str
-    first_name: str
-    last_name: str
-    account_type: str
-    created_at: str
-
-# ===== AUTHENTICATION FUNCTIONS =====
-
-def hash_password(password: str) -> str:
-    """Hash a password using bcrypt"""
-    return pwd_context.hash(password)
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify a password against its hash"""
-    return pwd_context.verify(plain_password, hashed_password)
-
-# ===== HEALTH CHECKS =====
+# ============================================
+# HEALTH ENDPOINTS
+# ============================================
 
 @app.get("/health")
 async def health():
-    """Simple health check"""
-    return {
-        "status": "healthy",
-        "service": "access-to-capital-api",
-        "timestamp": datetime.now().isoformat()
-    }
+    return {"status": "ok", "service": "blisspoint-tax-credit"}
 
 @app.get("/health/ready")
-async def ready():
-    """Ready check - verifies database connection"""
-    conn = get_db_connection()
-    if conn:
-        conn.close()
-        db_status = "connected"
-    else:
-        db_status = "disconnected"
-    
-    return {
-        "status": "ready",
-        "database": db_status,
-        "version": "1.0.0"
-    }
-
-# ===== USER REGISTRATION =====
-
-@app.post("/api/auth/register")
-async def register(user: UserRegister):
-    """
-    Register a new user
-    
-    Expects:
-    {
-      "email": "user@example.com",
-      "password": "securepass123",
-      "first_name": "John",
-      "last_name": "Doe",
-      "account_type": "consumer"
-    }
-    """
-    
-    # Validate inputs
-    if len(user.password) < 8:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Password must be at least 8 characters"
-        )
-    
-    if user.account_type not in ["consumer", "business"]:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Account type must be 'consumer' or 'business'"
-        )
-    
-    # Connect to database
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Database connection failed"
-        )
-    
+async def ready(db: Session = Depends(get_db)):
     try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
+        # Test database
+        db.execute(text("SELECT 1"))
         
-        # Check if email already exists
-        cur.execute("SELECT id FROM users WHERE email = %s", (user.email,))
-        if cur.fetchone():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Email already registered"
-            )
-        
-        # Hash password
-        password_hash = hash_password(user.password)
-        
-        # Insert user
-        cur.execute("""
-            INSERT INTO users (email, password_hash, first_name, last_name, account_type)
-            VALUES (%s, %s, %s, %s, %s)
-            RETURNING id, email, first_name, last_name, account_type, created_at
-        """, (user.email, password_hash, user.first_name, user.last_name, user.account_type))
-        
-        new_user = cur.fetchone()
-        conn.commit()
+        # Count deductions
+        deduction_count = db.query(DeductionRule).count()
         
         return {
-            "message": "User registered successfully",
-            "user": {
-                "id": new_user['id'],
-                "email": new_user['email'],
-                "first_name": new_user['first_name'],
-                "last_name": new_user['last_name'],
-                "account_type": new_user['account_type']
-            },
-            "status": "success"
+            "status": "ready",
+            "database": "connected",
+            "deductions_loaded": deduction_count
         }
-    
-    except Exception as e:
-        conn.rollback()
-        print(f"Registration error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Registration failed: {str(e)}"
-        )
-    finally:
-        cur.close()
-        conn.close()
-
-# ===== USER LOGIN =====
-
-@app.post("/api/auth/login")
-async def login(user: UserLogin):
-    """
-    Login a user
-    
-    Expects:
-    {
-      "email": "user@example.com",
-      "password": "securepass123"
-    }
-    """
-    
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Database connection failed"
-        )
-    
-    try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        
-        # Find user by email
-        cur.execute(
-            "SELECT id, password_hash, email, first_name, last_name, account_type FROM users WHERE email = %s",
-            (user.email,)
-        )
-        
-        db_user = cur.fetchone()
-        
-        if not db_user:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid email or password"
-            )
-        
-        # Verify password
-        if not verify_password(user.password, db_user['password_hash']):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid email or password"
-            )
-        
-        return {
-            "message": "Login successful",
-            "user": {
-                "id": db_user['id'],
-                "email": db_user['email'],
-                "first_name": db_user['first_name'],
-                "last_name": db_user['last_name'],
-                "account_type": db_user['account_type']
-            },
-            "access_token": f"token_{db_user['id']}_{datetime.now().timestamp()}",
-            "token_type": "bearer",
-            "status": "success"
-        }
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Login error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Login failed"
-        )
-    finally:
-        cur.close()
-        conn.close()
-
-# ===== GET USER PROFILE =====
-
-@app.get("/api/users/{user_id}")
-async def get_user(user_id: int):
-    """Get user profile by ID"""
-    
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Database connection failed"
-        )
-    
-    try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        
-        cur.execute(
-            "SELECT id, email, first_name, last_name, account_type, created_at FROM users WHERE id = %s",
-            (user_id,)
-        )
-        
-        user = cur.fetchone()
-        
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found"
-            )
-        
-        return {
-            "user": user,
-            "status": "success"
-        }
-    
-    except Exception as e:
-        print(f"Get user error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to fetch user"
-        )
-    finally:
-        cur.close()
-        conn.close()
-
-# ===== CONSUMER ACCOUNTS =====
-
-class ConsumerAccountCreate(BaseModel):
-    user_id: int
-    account_name: str
-    credit_limit: float = None
-
-@app.post("/api/consumer-accounts")
-async def create_consumer_account(account: ConsumerAccountCreate):
-    """
-    Create a new consumer credit account
-    
-    Expects:
-    {
-      "user_id": 1,
-      "account_name": "Chase Sapphire Preferred",
-      "credit_limit": 10000
-    }
-    """
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database error")
-    
-    try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        
-        # Verify user exists
-        cur.execute("SELECT id FROM users WHERE id = %s", (account.user_id,))
-        if not cur.fetchone():
-            raise HTTPException(status_code=404, detail="User not found")
-        
-        # Create account
-        cur.execute("""
-            INSERT INTO consumer_accounts 
-            (user_id, account_name, credit_limit, current_balance, payment_status)
-            VALUES (%s, %s, %s, 0, 'current')
-            RETURNING id, account_name, credit_limit, current_balance, created_at
-        """, (account.user_id, account.account_name, account.credit_limit))
-        
-        account = cur.fetchone()
-        conn.commit()
-        
-        return {
-            "message": "Consumer account created",
-            "account": account,
-            "status": "success"
-        }
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cur.close()
-        conn.close()
-
-@app.get("/api/consumer-accounts")
-async def get_consumer_accounts(user_id: int):
-    """Get all consumer accounts for a user"""
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database error")
-    
-    try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        
-        cur.execute("""
-            SELECT id, account_name, credit_limit, current_balance, payment_status, created_at
-            FROM consumer_accounts
-            WHERE user_id = %s
-            ORDER BY created_at DESC
-        """, (user_id,))
-        
-        accounts = cur.fetchall()
-        
-        return {
-            "accounts": accounts,
-            "total": len(accounts),
-            "status": "success"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cur.close()
-        conn.close()
-
-# ===== BUSINESS ACCOUNTS =====
-
-class BusinessAccountCreate(BaseModel):
-    user_id: int
-    business_name: str
-    ein: str = None
-    credit_limit: float = None
-
-@app.post("/api/business-accounts")
-async def create_business_account(account: BusinessAccountCreate):
-    """
-    Create a new business credit account
-    """
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database error")
-    
-    try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        
-        # Verify user exists
-        cur.execute("SELECT id FROM users WHERE id = %s", (account.user_id,))
-        if not cur.fetchone():
-            raise HTTPException(status_code=404, detail="User not found")
-        
-        # Create account
-        cur.execute("""
-            INSERT INTO business_accounts 
-            (user_id, business_name, ein, credit_limit, current_balance)
-            VALUES (%s, %s, %s, %s, 0)
-            RETURNING id, business_name, ein, credit_limit, current_balance, created_at
-        """, (account.user_id, account.business_name, account.ein, account.credit_limit))
-        
-        account = cur.fetchone()
-        conn.commit()
-        
-        return {
-            "message": "Business account created",
-            "account": account,
-            "status": "success"
-        }
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cur.close()
-        conn.close()
-
-@app.get("/api/business-accounts")
-async def get_business_accounts(user_id: int):
-    """Get all business accounts for a user"""
-    conn = get_db_connection()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Database error")
-    
-    try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        
-        cur.execute("""
-            SELECT id, business_name, ein, credit_limit, current_balance, created_at
-            FROM business_accounts
-            WHERE user_id = %s
-            ORDER BY created_at DESC
-        """, (user_id,))
-        
-        accounts = cur.fetchall()
-        
-        return {
-            "accounts": accounts,
-            "total": len(accounts),
-            "status": "success"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cur.close()
-        conn.close()
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    except:
+        raise HTTPException(status_code=503, detail="Database not connected")
