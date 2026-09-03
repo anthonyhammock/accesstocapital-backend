@@ -15,9 +15,6 @@ import re
 from app.database import get_db, engine
 from app.models import Base, DeductionRule, CategorizationRule, Transaction, TaxSummary
 
-# Create tables on startup
-Base.metadata.create_all(bind=engine)
-
 # Initialize app
 app = FastAPI(title="BlissPoint Tax & Credit", version="1.0.0")
 
