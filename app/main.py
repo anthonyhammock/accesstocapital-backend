@@ -12,7 +12,7 @@ import os
 import re
 
 from app.database import get_db, engine
-from app.models import Base, DeductionRule, CategorizationRule, Transaction, TaxSummary, User
+from app.models import Base, DeductionRule, CategorizationRule, Transaction, TaxSummary, User, ConsumerAccount, BusinessAccount
 import bcrypt
 
 app = FastAPI(title="BlissPoint Tax & Credit", version="1.0.0")
@@ -39,6 +39,7 @@ class RegisterRequest(BaseModel):
     first_name: str
     last_name: str
     account_type: str
+    business_name: str = None
 
 class LoginRequest(BaseModel):
     email: str
@@ -228,6 +229,32 @@ def categorize_merchant(merchant: str, db: Session) -> dict:
 # AUTH ENDPOINTS
 # ============================================
 
+ACCOUNTS_PER_BUREAU_SET = 3
+
+def provision_credit_builder_accounts(user: User, business_name: str, db: Session):
+    """Create the tradeline accounts a new subscriber gets reported to the bureaus.
+    Accounts start unfunded (no credit limit, $0 balance, not yet reported) —
+    the real limit is set once the funding/escrow step exists."""
+    if user.account_type in ('consumer', 'both'):
+        for i in range(1, ACCOUNTS_PER_BUREAU_SET + 1):
+            db.add(ConsumerAccount(
+                user_id=user.id,
+                account_name=f"Credit Builder Account {i}",
+                current_balance=Decimal(0),
+                reported_to_bureaus=False
+            ))
+
+    if user.account_type in ('business', 'both'):
+        for i in range(1, ACCOUNTS_PER_BUREAU_SET + 1):
+            db.add(BusinessAccount(
+                user_id=user.id,
+                business_name=business_name,
+                current_balance=Decimal(0),
+                reported_to_bureaus=False
+            ))
+
+    db.commit()
+
 @app.post("/api/auth/register")
 async def register(payload: RegisterRequest, db: Session = Depends(get_db)):
     existing = db.query(User).filter(User.email == payload.email).first()
@@ -236,6 +263,12 @@ async def register(payload: RegisterRequest, db: Session = Depends(get_db)):
 
     if len(payload.password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
+
+    if payload.account_type not in ('consumer', 'business', 'both'):
+        raise HTTPException(status_code=400, detail="account_type must be 'consumer', 'business', or 'both'.")
+
+    if payload.account_type in ('business', 'both') and not payload.business_name:
+        raise HTTPException(status_code=400, detail="Business name is required for a business account.")
 
     hashed = bcrypt.hashpw(payload.password.encode('utf-8'), bcrypt.gensalt())
 
@@ -250,6 +283,8 @@ async def register(payload: RegisterRequest, db: Session = Depends(get_db)):
     db.add(user)
     db.commit()
     db.refresh(user)
+
+    provision_credit_builder_accounts(user, payload.business_name, db)
 
     return {'status': 'success', 'user_id': user.id}
 
@@ -274,6 +309,38 @@ async def login(payload: LoginRequest, db: Session = Depends(get_db)):
         }
     }
 
+
+@app.get("/api/consumer-accounts")
+async def get_consumer_accounts(user_id: int, db: Session = Depends(get_db)):
+    accounts = db.query(ConsumerAccount).filter(ConsumerAccount.user_id == user_id).all()
+    return {
+        'accounts': [
+            {
+                'id': a.id,
+                'account_name': a.account_name,
+                'credit_limit': float(a.credit_limit) if a.credit_limit is not None else None,
+                'current_balance': float(a.current_balance) if a.current_balance is not None else None,
+                'payment_status': a.payment_status
+            }
+            for a in accounts
+        ]
+    }
+
+@app.get("/api/business-accounts")
+async def get_business_accounts(user_id: int, db: Session = Depends(get_db)):
+    accounts = db.query(BusinessAccount).filter(BusinessAccount.user_id == user_id).all()
+    return {
+        'accounts': [
+            {
+                'id': a.id,
+                'business_name': a.business_name,
+                'ein': a.ein,
+                'credit_limit': float(a.credit_limit) if a.credit_limit is not None else None,
+                'current_balance': float(a.current_balance) if a.current_balance is not None else None
+            }
+            for a in accounts
+        ]
+    }
 
 @app.get("/api/tax/questionnaire-questions")
 async def get_questionnaire_questions(db: Session = Depends(get_db)):
