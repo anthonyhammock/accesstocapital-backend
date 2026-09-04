@@ -10,6 +10,7 @@ import json
 from datetime import datetime
 import os
 import re
+import uuid
 
 from app.database import get_db, engine
 from app.models import Base, DeductionRule, CategorizationRule, Transaction, TaxSummary, User, ConsumerAccount, BusinessAccount
@@ -44,6 +45,13 @@ class RegisterRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: str
     password: str
+
+class AddBusinessRequest(BaseModel):
+    user_id: int
+    business_name: str
+    ein: str = None
+    business_type: str = None
+    annual_revenue: Decimal = None
 
 class TransactionInput(BaseModel):
     merchant_name: str
@@ -230,6 +238,25 @@ def categorize_merchant(merchant: str, db: Session) -> dict:
 # ============================================
 
 ACCOUNTS_PER_BUREAU_SET = 3
+ADDITIONAL_BUSINESS_MONTHLY_FEE = Decimal('50.00')
+
+def provision_business_accounts(user_id: int, business_name: str, ein: str, business_type: str, annual_revenue, db: Session) -> str:
+    """Create one business's set of tradeline accounts, tagged with a shared
+    business_group_id so they can be told apart from any other business the
+    same user has. Returns the new business_group_id."""
+    group_id = str(uuid.uuid4())
+    for i in range(1, ACCOUNTS_PER_BUREAU_SET + 1):
+        db.add(BusinessAccount(
+            user_id=user_id,
+            business_group_id=group_id,
+            business_name=business_name,
+            ein=ein,
+            business_type=business_type,
+            annual_revenue=annual_revenue,
+            current_balance=Decimal(0),
+            reported_to_bureaus=False
+        ))
+    return group_id
 
 def provision_credit_builder_accounts(user: User, business_name: str, db: Session):
     """Create the tradeline accounts a new subscriber gets reported to the bureaus.
@@ -245,13 +272,7 @@ def provision_credit_builder_accounts(user: User, business_name: str, db: Sessio
             ))
 
     if user.account_type in ('business', 'both'):
-        for i in range(1, ACCOUNTS_PER_BUREAU_SET + 1):
-            db.add(BusinessAccount(
-                user_id=user.id,
-                business_name=business_name,
-                current_balance=Decimal(0),
-                reported_to_bureaus=False
-            ))
+        provision_business_accounts(user.id, business_name, None, None, None, db)
 
     db.commit()
 
@@ -340,6 +361,54 @@ async def get_business_accounts(user_id: int, db: Session = Depends(get_db)):
             }
             for a in accounts
         ]
+    }
+
+@app.get("/api/businesses")
+async def get_businesses(user_id: int, db: Session = Depends(get_db)):
+    """List the distinct businesses a user has (each is a group of ACCOUNTS_PER_BUREAU_SET
+    tradeline accounts sharing a business_group_id), with the monthly fee for each."""
+    accounts = db.query(BusinessAccount).filter(BusinessAccount.user_id == user_id).order_by(BusinessAccount.created_at).all()
+
+    groups = {}
+    for a in accounts:
+        key = a.business_group_id or f"legacy-{a.business_name}-{a.ein or ''}"
+        if key not in groups:
+            groups[key] = {
+                'business_group_id': a.business_group_id,
+                'business_name': a.business_name,
+                'ein': a.ein,
+                'business_type': a.business_type,
+                'annual_revenue': float(a.annual_revenue) if a.annual_revenue is not None else None,
+                'monthly_fee': float(ADDITIONAL_BUSINESS_MONTHLY_FEE),
+                'billing_status': 'pending_payment_setup',
+                'account_ids': []
+            }
+        groups[key]['account_ids'].append(a.id)
+
+    return {'businesses': list(groups.values())}
+
+@app.post("/api/businesses")
+async def add_business(payload: AddBusinessRequest, db: Session = Depends(get_db)):
+    """Add an additional business for an existing user (e.g. an owner of multiple
+    businesses who each need their own 3 reported tradeline accounts).
+    NOTE: real payment collection isn't wired up yet — this creates the business's
+    accounts and reports a monthly_fee of $50, but does not charge anything. The
+    business is created in 'pending_payment_setup' billing status until Stripe
+    billing is built; that's expected to catch up and start real billing then."""
+    user = db.query(User).filter(User.id == payload.user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    group_id = provision_business_accounts(
+        user.id, payload.business_name, payload.ein, payload.business_type, payload.annual_revenue, db
+    )
+    db.commit()
+
+    return {
+        'status': 'success',
+        'business_group_id': group_id,
+        'monthly_fee': float(ADDITIONAL_BUSINESS_MONTHLY_FEE),
+        'billing_status': 'pending_payment_setup'
     }
 
 @app.get("/api/tax/questionnaire-questions")

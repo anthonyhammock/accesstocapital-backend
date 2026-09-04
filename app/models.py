@@ -36,6 +36,7 @@ class BusinessAccount(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    business_group_id = Column(String(36), nullable=True, index=True)
     business_name = Column(String(255), nullable=False)
     ein = Column(String(50), nullable=True)
     business_type = Column(String(100), nullable=True)
