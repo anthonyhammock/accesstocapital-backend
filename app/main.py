@@ -45,8 +45,6 @@ class LoginRequest(BaseModel):
     password: str
 
 class TransactionInput(BaseModel):
-
-class TransactionInput(BaseModel):
     merchant_name: str
     amount: Decimal
     transaction_date: str
