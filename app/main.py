@@ -276,8 +276,6 @@ async def login(payload: LoginRequest, db: Session = Depends(get_db)):
 
 
 @app.get("/api/tax/questionnaire-questions")
-
-@app.get("/api/tax/questionnaire-questions")
 async def get_questionnaire_questions(db: Session = Depends(get_db)):
     """Plain-language questions for the guided walkthrough, one per business deduction rule."""
     rules = db.query(DeductionRule).order_by(DeductionRule.deduction_name).all()
