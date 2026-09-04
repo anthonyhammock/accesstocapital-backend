@@ -12,7 +12,8 @@ import os
 import re
 
 from app.database import get_db, engine
-from app.models import Base, DeductionRule, CategorizationRule, Transaction, TaxSummary
+from app.models import Base, DeductionRule, CategorizationRule, Transaction, TaxSummary, User
+import bcrypt
 
 app = FastAPI(title="BlissPoint Tax & Credit", version="1.0.0")
 
@@ -31,6 +32,19 @@ app.add_middleware(
 # ============================================
 # PYDANTIC MODELS
 # ============================================
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+    first_name: str
+    last_name: str
+    account_type: str
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class TransactionInput(BaseModel):
 
 class TransactionInput(BaseModel):
     merchant_name: str
@@ -211,6 +225,59 @@ def categorize_merchant(merchant: str, db: Session) -> dict:
 # ============================================
 # QUESTIONNAIRE ENDPOINTS (new)
 # ============================================
+
+# ============================================
+# AUTH ENDPOINTS
+# ============================================
+
+@app.post("/api/auth/register")
+async def register(payload: RegisterRequest, db: Session = Depends(get_db)):
+    existing = db.query(User).filter(User.email == payload.email).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="An account with this email already exists.")
+
+    if len(payload.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
+
+    hashed = bcrypt.hashpw(payload.password.encode('utf-8'), bcrypt.gensalt())
+
+    user = User(
+        email=payload.email,
+        password_hash=hashed.decode('utf-8'),
+        first_name=payload.first_name,
+        last_name=payload.last_name,
+        account_type=payload.account_type,
+        is_active=True
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    return {'status': 'success', 'user_id': user.id}
+
+@app.post("/api/auth/login")
+async def login(payload: LoginRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == payload.email).first()
+
+    if not user or not bcrypt.checkpw(payload.password.encode('utf-8'), user.password_hash.encode('utf-8')):
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="This account has been deactivated.")
+
+    return {
+        'status': 'success',
+        'user': {
+            'id': user.id,
+            'email': user.email,
+            'first_name': user.first_name,
+            'last_name': user.last_name,
+            'account_type': user.account_type
+        }
+    }
+
+
+@app.get("/api/tax/questionnaire-questions")
 
 @app.get("/api/tax/questionnaire-questions")
 async def get_questionnaire_questions(db: Session = Depends(get_db)):
