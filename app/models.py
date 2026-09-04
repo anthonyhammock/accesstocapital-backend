@@ -17,6 +17,36 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     is_active = Column(Boolean, default=True)
 
+class ConsumerAccount(Base):
+    __tablename__ = "consumer_accounts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    account_name = Column(String(255), nullable=False)
+    account_number = Column(String(255), nullable=True)
+    credit_limit = Column(Numeric(12, 2), nullable=True)
+    current_balance = Column(Numeric(12, 2), nullable=True)
+    payment_status = Column(String(50), nullable=True)
+    reported_to_bureaus = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class BusinessAccount(Base):
+    __tablename__ = "business_accounts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    business_group_id = Column(String(36), nullable=True, index=True)
+    business_name = Column(String(255), nullable=False)
+    ein = Column(String(50), nullable=True)
+    business_type = Column(String(100), nullable=True)
+    annual_revenue = Column(Numeric(14, 2), nullable=True)
+    credit_limit = Column(Numeric(12, 2), nullable=True)
+    current_balance = Column(Numeric(12, 2), nullable=True)
+    reported_to_bureaus = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
 class DeductionRule(Base):
     __tablename__ = "deduction_rules"
 
