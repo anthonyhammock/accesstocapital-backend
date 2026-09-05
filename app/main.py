@@ -26,6 +26,7 @@ from app.models import (
     SchedulingSettings, AvailabilityRule, Booking, CalendarConnection,
 )
 from app.auth import create_access_token, get_current_user_id, create_oauth_state_token, verify_oauth_state_token
+from app.trading import router as trading_router
 import bcrypt
 
 app = FastAPI(title="BlissPoint Tax & Credit", version="1.0.0")
@@ -41,6 +42,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(trading_router)
 
 # ============================================
 # PYDANTIC MODELS

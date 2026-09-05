@@ -230,6 +230,82 @@ class CalendarConnection(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+class WatchlistEntry(Base):
+    __tablename__ = "watchlist_entries"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    symbol = Column(String(20), nullable=False, index=True)
+    timeframe = Column(String(10), nullable=False, default='1h')  # '5min','15min','1h','1day'
+    strategy_type = Column(String(20), nullable=False, default='hybrid')  # momentum/mean_reversion/breakout/hybrid
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class Signal(Base):
+    __tablename__ = "signals"
+
+    # Signals are generated once per (symbol, timeframe) — NOT per user, even
+    # though many users may watch the same symbol. A user's "current signals"
+    # is computed by joining their active WatchlistEntry rows against recent
+    # rows here, so 500 users watching AAPL still costs one market-data fetch
+    # and one signal row, not 500.
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String(20), nullable=False, index=True)
+    timeframe = Column(String(10), nullable=False)
+    signal_type = Column(String(10), nullable=False)  # 'buy' or 'sell'
+    confidence = Column(Integer, nullable=False)  # 0-100
+    entry_price = Column(Numeric(14, 4), nullable=False)
+    target_price = Column(Numeric(14, 4), nullable=True)
+    stop_loss = Column(Numeric(14, 4), nullable=True)
+    risk_reward_ratio = Column(Numeric(6, 2), nullable=True)
+    reason = Column(Text, nullable=True)
+    market_condition = Column(String(20), nullable=True)  # uptrend/downtrend/ranging
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+class AlertPreference(Base):
+    __tablename__ = "alert_preferences"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, unique=True, index=True)
+    email_enabled = Column(Boolean, default=True)
+    sms_enabled = Column(Boolean, default=False)
+    sms_phone = Column(String(20), nullable=True)
+    min_confidence = Column(Integer, nullable=False, default=75)
+    quiet_hours_start = Column(Time, nullable=True)
+    quiet_hours_end = Column(Time, nullable=True)
+    digest_mode = Column(Boolean, default=False)
+    last_viewed_signals_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class SignalAlert(Base):
+    __tablename__ = "signal_alerts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    signal_id = Column(Integer, ForeignKey("signals.id"), nullable=False, index=True)
+    delivery_method = Column(String(10), nullable=False)  # email/sms/in_app
+    status = Column(String(10), nullable=False, default='sent')  # sent/failed/skipped
+    sent_at = Column(DateTime, default=datetime.utcnow)
+
+class TradeLog(Base):
+    __tablename__ = "trade_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    signal_id = Column(Integer, ForeignKey("signals.id"), nullable=True)
+    symbol = Column(String(20), nullable=False)
+    side = Column(String(10), nullable=False, default='long')  # long/short
+    shares = Column(Numeric(14, 4), nullable=False)
+    entry_price = Column(Numeric(14, 4), nullable=False)
+    entry_at = Column(DateTime, nullable=False)
+    exit_price = Column(Numeric(14, 4), nullable=True)
+    exit_at = Column(DateTime, nullable=True)
+    status = Column(String(10), nullable=False, default='open')  # open/closed
+    pnl = Column(Numeric(14, 2), nullable=True)
+    roi_pct = Column(Numeric(8, 2), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 class TaxSummary(Base):
     __tablename__ = "tax_summaries"
 
