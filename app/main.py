@@ -454,7 +454,8 @@ async def get_me(user_id: int = Depends(get_current_user_id), db: Session = Depe
         'email': user.email,
         'first_name': user.first_name,
         'last_name': user.last_name,
-        'account_type': user.account_type
+        'account_type': user.account_type,
+        'is_admin': user.is_admin,
     }
 
 @app.get("/api/consumer-accounts")

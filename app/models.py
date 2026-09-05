@@ -23,6 +23,11 @@ class User(Base):
     # own tracking (and, once real billing exists, to exclude it from
     # charges) — the two are independent (an admin isn't automatically
     # comped, a comped user isn't automatically an admin).
+    #
+    # default=False here is Python-side only (SQLAlchemy applies it on
+    # INSERT, not to existing rows) — any manual ALTER TABLE against the
+    # already-populated production `users` table MUST include an explicit
+    # DEFAULT FALSE, or Postgres will reject a NOT NULL column add outright.
     is_admin = Column(Boolean, nullable=False, default=False)
     is_comped = Column(Boolean, nullable=False, default=False)
 
