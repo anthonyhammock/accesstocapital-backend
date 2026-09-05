@@ -29,6 +29,7 @@ from app.auth import create_access_token, get_current_user_id, create_oauth_stat
 from app.trading import router as trading_router
 from app.vendors import router as vendors_router
 from app.invoicing import router as invoicing_router
+from app.admin import router as admin_router
 import bcrypt
 
 app = FastAPI(title="BlissPoint Tax & Credit", version="1.0.0")
@@ -48,6 +49,7 @@ app.add_middleware(
 app.include_router(trading_router)
 app.include_router(vendors_router)
 app.include_router(invoicing_router)
+app.include_router(admin_router)
 
 # ============================================
 # PYDANTIC MODELS
@@ -433,7 +435,8 @@ async def login(payload: LoginRequest, db: Session = Depends(get_db)):
             'email': user.email,
             'first_name': user.first_name,
             'last_name': user.last_name,
-            'account_type': user.account_type
+            'account_type': user.account_type,
+            'is_admin': user.is_admin,
         }
     }
 

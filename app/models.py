@@ -17,6 +17,15 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     is_active = Column(Boolean, default=True)
 
+    # No self-service path to either of these — set directly in the DB by
+    # the platform owner. is_admin gates every /api/admin/* endpoint;
+    # is_comped just marks an account as free/test access for the owner's
+    # own tracking (and, once real billing exists, to exclude it from
+    # charges) — the two are independent (an admin isn't automatically
+    # comped, a comped user isn't automatically an admin).
+    is_admin = Column(Boolean, nullable=False, default=False)
+    is_comped = Column(Boolean, nullable=False, default=False)
+
 class ConsumerAccount(Base):
     __tablename__ = "consumer_accounts"
 
