@@ -316,6 +316,55 @@ class TradeLog(Base):
     roi_pct = Column(Numeric(8, 2), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class Vendor(Base):
+    __tablename__ = "vendors"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    email = Column(String(255), nullable=True)
+    phone = Column(String(50), nullable=True)
+    address = Column(Text, nullable=True)
+    payment_terms = Column(String(20), nullable=False, default='net_30')  # due_on_receipt/net_15/net_30/net_45/net_60
+    notes = Column(Text, nullable=True)
+    is_active = Column(Boolean, default=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class Bill(Base):
+    __tablename__ = "bills"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    vendor_id = Column(Integer, ForeignKey("vendors.id"), nullable=False, index=True)
+    bill_number = Column(String(100), nullable=True)
+    bill_date = Column(DateTime, nullable=False)
+    due_date = Column(DateTime, nullable=False, index=True)
+    amount = Column(Numeric(14, 2), nullable=False)
+    category = Column(String(100), nullable=True)
+    memo = Column(Text, nullable=True)
+
+    # 'paid'/'overdue'/'partial'/'unpaid' is never stored — always derived
+    # from amount vs. the live sum of this bill's BillPayment rows plus
+    # due_date vs. today, so it can never drift out of sync with the actual
+    # payment history the way a cached status column could.
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class BillPayment(Base):
+    __tablename__ = "bill_payments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    bill_id = Column(Integer, ForeignKey("bills.id"), nullable=False, index=True)
+    amount = Column(Numeric(14, 2), nullable=False)
+    payment_date = Column(DateTime, nullable=False)
+    payment_method = Column(String(20), nullable=False, default='other')  # check/ach/card/wire/cash/other
+    reference_number = Column(String(100), nullable=True)
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 class TaxSummary(Base):
     __tablename__ = "tax_summaries"
 
