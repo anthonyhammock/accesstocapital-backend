@@ -31,6 +31,7 @@ from app.vendors import router as vendors_router
 from app.invoicing import router as invoicing_router
 from app.admin import router as admin_router
 from app.crm import router as crm_router
+from app.balance_sheet import router as balance_sheet_router
 import bcrypt
 
 app = FastAPI(title="BlissPoint Tax & Credit", version="1.0.0")
@@ -52,6 +53,7 @@ app.include_router(vendors_router)
 app.include_router(invoicing_router)
 app.include_router(admin_router)
 app.include_router(crm_router)
+app.include_router(balance_sheet_router)
 
 # ============================================
 # PYDANTIC MODELS

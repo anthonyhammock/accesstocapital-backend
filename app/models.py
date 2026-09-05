@@ -480,6 +480,36 @@ class DealNote(Base):
     body = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class BalanceSheetItem(Base):
+    __tablename__ = "balance_sheet_items"
+
+    # Manually-tracked assets/liabilities the platform has no other feed
+    # for (equipment, inventory, loans, credit lines) — a current balance
+    # the owner updates directly, same pattern as a Vendor's running
+    # balance rather than a dated transaction history.
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    side = Column(String(20), nullable=False, index=True)  # 'asset' or 'liability'
+    name = Column(String(255), nullable=False)
+    amount = Column(Numeric(14, 2), nullable=False)
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class OwnerEquityEntry(Base):
+    __tablename__ = "owner_equity_entries"
+
+    # Feeds both the Balance Sheet's equity section and the Statement of
+    # Owner's Equity roll-forward — one entry, two reports, rather than
+    # two parallel places to record the same contribution or draw.
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    entry_type = Column(String(20), nullable=False, index=True)  # 'contribution' or 'draw'
+    amount = Column(Numeric(14, 2), nullable=False)
+    entry_date = Column(DateTime, nullable=False)
+    description = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 class TaxSummary(Base):
     __tablename__ = "tax_summaries"
 
