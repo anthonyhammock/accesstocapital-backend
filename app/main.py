@@ -30,6 +30,7 @@ from app.trading import router as trading_router
 from app.vendors import router as vendors_router
 from app.invoicing import router as invoicing_router
 from app.admin import router as admin_router
+from app.crm import router as crm_router
 import bcrypt
 
 app = FastAPI(title="BlissPoint Tax & Credit", version="1.0.0")
@@ -50,6 +51,7 @@ app.include_router(trading_router)
 app.include_router(vendors_router)
 app.include_router(invoicing_router)
 app.include_router(admin_router)
+app.include_router(crm_router)
 
 # ============================================
 # PYDANTIC MODELS
@@ -76,6 +78,15 @@ class AddBusinessRequest(BaseModel):
 class PortalClientCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     email: str | None = None
+    phone: str | None = None
+    company: str | None = None
+    notes: str | None = None
+
+class PortalClientUpdate(BaseModel):
+    name: str | None = None
+    email: str | None = None
+    phone: str | None = None
+    company: str | None = None
     notes: str | None = None
 
 class PortalCommentCreate(BaseModel):
@@ -1153,6 +1164,8 @@ async def create_portal_client(
         user_id=user_id,
         name=payload.name,
         email=payload.email,
+        phone=payload.phone,
+        company=payload.company,
         notes=payload.notes,
         portal_token=secrets.token_urlsafe(32),
     )
@@ -1163,6 +1176,8 @@ async def create_portal_client(
         'id': client.id,
         'name': client.name,
         'email': client.email,
+        'phone': client.phone,
+        'company': client.company,
         'notes': client.notes,
         'portal_token': client.portal_token,
         'is_active': client.is_active,
@@ -1189,6 +1204,8 @@ async def list_portal_clients(user_id: int = Depends(get_current_user_id), db: S
                 'id': c.id,
                 'name': c.name,
                 'email': c.email,
+                'phone': c.phone,
+                'company': c.company,
                 'notes': c.notes,
                 'portal_token': c.portal_token,
                 'is_active': c.is_active,
@@ -1210,11 +1227,32 @@ async def get_portal_client(client_id: int, user_id: int = Depends(get_current_u
         'id': client.id,
         'name': client.name,
         'email': client.email,
+        'phone': client.phone,
+        'company': client.company,
         'notes': client.notes,
         'portal_token': client.portal_token,
         'is_active': client.is_active,
         'created_at': client.created_at.isoformat() if client.created_at else None,
         'documents': [serialize_portal_document(d) for d in documents],
+    }
+
+@app.put("/api/portal/clients/{client_id}")
+async def update_portal_client(client_id: int, payload: PortalClientUpdate, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    client = get_owned_client(client_id, user_id, db)
+    for field in ('name', 'email', 'phone', 'company', 'notes'):
+        value = getattr(payload, field)
+        if value is not None:
+            setattr(client, field, value)
+    db.commit()
+    db.refresh(client)
+    return {
+        'id': client.id,
+        'name': client.name,
+        'email': client.email,
+        'phone': client.phone,
+        'company': client.company,
+        'notes': client.notes,
+        'is_active': client.is_active,
     }
 
 @app.post("/api/portal/clients/{client_id}/regenerate-link")
