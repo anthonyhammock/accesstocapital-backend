@@ -16,7 +16,8 @@ from datetime import datetime
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
@@ -31,27 +32,43 @@ OPEN_STAGES = ['lead', 'qualified', 'proposal', 'negotiation']
 CLOSED_STAGES = ['won', 'lost']
 VALID_STAGES = OPEN_STAGES + CLOSED_STAGES
 
+# Matches Deal.value / InvoiceLineItem.unit_price -> Numeric(12, 2): 10
+# digits before the decimal point.
+MAX_DEAL_VALUE = Decimal('9999999999.99')
+
+
+def _non_blank(value: str | None) -> str | None:
+    if value is not None and not value.strip():
+        raise ValueError('must not be blank')
+    return value
+
 
 # --- Pydantic payloads ---
 
 class DealCreate(BaseModel):
     client_id: int
     title: str = Field(..., min_length=1, max_length=255)
-    value: Decimal = Field(default=Decimal(0), ge=0)
+    value: Decimal = Field(default=Decimal(0), ge=0, le=MAX_DEAL_VALUE)
     expected_close_date: datetime | None = None
     notes: str | None = None
 
+    _check_title = field_validator('title')(_non_blank)
+
 class DealUpdate(BaseModel):
-    title: str | None = None
-    value: Decimal | None = Field(None, ge=0)
+    title: str | None = Field(None, min_length=1, max_length=255)
+    value: Decimal | None = Field(None, ge=0, le=MAX_DEAL_VALUE)
     expected_close_date: datetime | None = None
     notes: str | None = None
+
+    _check_title = field_validator('title')(_non_blank)
 
 class StageUpdate(BaseModel):
     stage: str
 
 class NoteCreate(BaseModel):
     body: str = Field(..., min_length=1)
+
+    _check_body = field_validator('body')(_non_blank)
 
 
 # --- Ownership helpers ---
@@ -187,17 +204,44 @@ async def convert_to_invoice(deal_id: int, user_id: int = Depends(get_current_us
         raise HTTPException(status_code=400, detail="This deal has already been converted to an invoice.")
 
     now = datetime.utcnow()
-    invoice = Invoice(
-        user_id=user_id, client_id=deal.client_id,
-        invoice_number=next_invoice_number(user_id, db),
-        issue_date=now, due_date=now,
-        tax_rate=0, notes=f"Generated from CRM deal: {deal.title}",
-        public_token=secrets.token_urlsafe(32),
-    )
-    db.add(invoice)
-    db.flush()
+    # Mirrors create_invoice() in app/invoicing.py: next_invoice_number()
+    # is read-then-write with no lock, so retry once against the
+    # (user_id, invoice_number) unique constraint rather than surfacing a
+    # raw 500 for what's a rare, recoverable race.
+    for attempt in range(2):
+        invoice = Invoice(
+            user_id=user_id, client_id=deal.client_id,
+            invoice_number=next_invoice_number(user_id, db),
+            issue_date=now, due_date=now,
+            tax_rate=0, notes=f"Generated from CRM deal: {deal.title}",
+            public_token=secrets.token_urlsafe(32),
+        )
+        db.add(invoice)
+        try:
+            db.flush()
+            break
+        except IntegrityError:
+            db.rollback()
+            if attempt == 1:
+                raise HTTPException(status_code=409, detail="Could not assign an invoice number — please try again.")
+
     db.add(InvoiceLineItem(invoice_id=invoice.id, description=deal.title, quantity=1, unit_price=deal.value, sort_order=0))
-    deal.invoice_id = invoice.id
+    db.flush()
+
+    # Atomic claim: the UPDATE's WHERE clause re-checks invoice_id IS NULL
+    # at the database level, so two concurrent requests can't both "win" —
+    # only one UPDATE can match the row. The check above is just a fast
+    # path; this is what actually prevents a double conversion. No
+    # SELECT ... FOR UPDATE is needed, so nothing holds a row lock across
+    # the invoice_number lookup or the retry loop above.
+    claimed = db.query(Deal).filter(
+        Deal.id == deal_id, Deal.user_id == user_id, Deal.invoice_id.is_(None),
+    ).update({'invoice_id': invoice.id}, synchronize_session=False)
+
+    if claimed == 0:
+        db.rollback()  # someone else converted this deal first — discard our invoice
+        raise HTTPException(status_code=400, detail="This deal has already been converted to an invoice.")
+
     db.commit()
     db.refresh(invoice)
     return {'status': 'success', 'invoice_id': invoice.id, 'invoice_number': invoice.invoice_number}

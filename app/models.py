@@ -452,7 +452,10 @@ class Deal(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     client_id = Column(Integer, ForeignKey("portal_clients.id"), nullable=False, index=True)
     title = Column(String(255), nullable=False)
-    value = Column(Numeric(14, 2), nullable=False, default=0)
+    # Numeric(12, 2) to match InvoiceLineItem.unit_price — a deal converts
+    # straight into a line item, so the two must share the same precision
+    # or a large deal value overflows the invoice line item column.
+    value = Column(Numeric(12, 2), nullable=False, default=0)
     stage = Column(String(20), nullable=False, default='lead', index=True)  # lead/qualified/proposal/negotiation/won/lost
     expected_close_date = Column(DateTime, nullable=True)
     notes = Column(Text, nullable=True)

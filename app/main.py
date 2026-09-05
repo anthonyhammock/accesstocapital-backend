@@ -78,15 +78,15 @@ class AddBusinessRequest(BaseModel):
 class PortalClientCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     email: str | None = None
-    phone: str | None = None
-    company: str | None = None
+    phone: str | None = Field(None, max_length=50)
+    company: str | None = Field(None, max_length=255)
     notes: str | None = None
 
 class PortalClientUpdate(BaseModel):
-    name: str | None = None
+    name: str | None = Field(None, min_length=1, max_length=255)
     email: str | None = None
-    phone: str | None = None
-    company: str | None = None
+    phone: str | None = Field(None, max_length=50)
+    company: str | None = Field(None, max_length=255)
     notes: str | None = None
 
 class PortalCommentCreate(BaseModel):
