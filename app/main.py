@@ -14,6 +14,7 @@ import uuid
 
 from app.database import get_db, engine
 from app.models import Base, DeductionRule, CategorizationRule, Transaction, TaxSummary, User, ConsumerAccount, BusinessAccount
+from app.auth import create_access_token, get_current_user_id
 import bcrypt
 
 app = FastAPI(title="BlissPoint Tax & Credit", version="1.0.0")
@@ -47,7 +48,6 @@ class LoginRequest(BaseModel):
     password: str
 
 class AddBusinessRequest(BaseModel):
-    user_id: int
     business_name: str
     ein: str = None
     business_type: str = None
@@ -60,7 +60,6 @@ class TransactionInput(BaseModel):
     deduction_code: str = None
 
 class CalculationRequest(BaseModel):
-    user_id: int
     tax_year: int
     entity_type: str
     transactions: list = []
@@ -71,7 +70,6 @@ class QuestionnaireAnswer(BaseModel):
     amount: Decimal = Decimal(0)
 
 class QuestionnaireSubmission(BaseModel):
-    user_id: int
     tax_year: int
     entity_type: str
     answers: list[QuestionnaireAnswer]
@@ -321,6 +319,7 @@ async def login(payload: LoginRequest, db: Session = Depends(get_db)):
 
     return {
         'status': 'success',
+        'token': create_access_token(user.id),
         'user': {
             'id': user.id,
             'email': user.email,
@@ -332,7 +331,7 @@ async def login(payload: LoginRequest, db: Session = Depends(get_db)):
 
 
 @app.get("/api/consumer-accounts")
-async def get_consumer_accounts(user_id: int, db: Session = Depends(get_db)):
+async def get_consumer_accounts(user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
     accounts = db.query(ConsumerAccount).filter(ConsumerAccount.user_id == user_id).all()
     return {
         'accounts': [
@@ -348,7 +347,7 @@ async def get_consumer_accounts(user_id: int, db: Session = Depends(get_db)):
     }
 
 @app.get("/api/business-accounts")
-async def get_business_accounts(user_id: int, db: Session = Depends(get_db)):
+async def get_business_accounts(user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
     accounts = db.query(BusinessAccount).filter(BusinessAccount.user_id == user_id).all()
     return {
         'accounts': [
@@ -364,7 +363,7 @@ async def get_business_accounts(user_id: int, db: Session = Depends(get_db)):
     }
 
 @app.get("/api/businesses")
-async def get_businesses(user_id: int, db: Session = Depends(get_db)):
+async def get_businesses(user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
     """List the distinct businesses a user has (each is a group of ACCOUNTS_PER_BUREAU_SET
     tradeline accounts sharing a business_group_id), with the monthly fee for each."""
     accounts = db.query(BusinessAccount).filter(BusinessAccount.user_id == user_id).order_by(BusinessAccount.created_at).all()
@@ -388,14 +387,14 @@ async def get_businesses(user_id: int, db: Session = Depends(get_db)):
     return {'businesses': list(groups.values())}
 
 @app.post("/api/businesses")
-async def add_business(payload: AddBusinessRequest, db: Session = Depends(get_db)):
+async def add_business(payload: AddBusinessRequest, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
     """Add an additional business for an existing user (e.g. an owner of multiple
     businesses who each need their own 3 reported tradeline accounts).
     NOTE: real payment collection isn't wired up yet — this creates the business's
     accounts and reports a monthly_fee of $50, but does not charge anything. The
     business is created in 'pending_payment_setup' billing status until Stripe
     billing is built; that's expected to catch up and start real billing then."""
-    user = db.query(User).filter(User.id == payload.user_id).first()
+    user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
 
@@ -427,7 +426,7 @@ async def get_questionnaire_questions(db: Session = Depends(get_db)):
     }
 
 @app.post("/api/tax/submit-questionnaire")
-async def submit_questionnaire(payload: QuestionnaireSubmission, db: Session = Depends(get_db)):
+async def submit_questionnaire(payload: QuestionnaireSubmission, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
     """Save walkthrough answers as transactions, then calculate deductions from them."""
     try:
         year_start = datetime(payload.tax_year, 1, 1)
@@ -436,7 +435,7 @@ async def submit_questionnaire(payload: QuestionnaireSubmission, db: Session = D
         # Clear previous questionnaire answers for this user/year so re-submitting
         # (e.g. after changing an answer) doesn't double-count old ones.
         db.query(Transaction).filter(
-            Transaction.user_id == payload.user_id,
+            Transaction.user_id == user_id,
             Transaction.category == 'questionnaire',
             Transaction.transaction_date >= year_start,
             Transaction.transaction_date <= year_end
@@ -454,7 +453,7 @@ async def submit_questionnaire(payload: QuestionnaireSubmission, db: Session = D
                 continue
 
             db.add(Transaction(
-                user_id=payload.user_id,
+                user_id=user_id,
                 transaction_date=datetime(payload.tax_year, 12, 31),
                 merchant_name=rule.deduction_name,
                 amount=answer.amount,
@@ -466,7 +465,7 @@ async def submit_questionnaire(payload: QuestionnaireSubmission, db: Session = D
         db.commit()
 
         return compute_tax_summary(
-            payload.user_id, payload.tax_year, payload.entity_type,
+            user_id, payload.tax_year, payload.entity_type,
             payload.officer_wages, db
         )
 
@@ -480,8 +479,8 @@ async def submit_questionnaire(payload: QuestionnaireSubmission, db: Session = D
 
 @app.post("/api/tax/upload-csv")
 async def upload_csv(
-    user_id: int,
     file: UploadFile = File(...),
+    user_id: int = Depends(get_current_user_id),
     db: Session = Depends(get_db)
 ):
     try:
@@ -560,10 +559,10 @@ async def upload_csv(
 # ============================================
 
 @app.post("/api/tax/calculate-deductions")
-async def calculate(payload: CalculationRequest, db: Session = Depends(get_db)):
+async def calculate(payload: CalculationRequest, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
     try:
         return compute_tax_summary(
-            payload.user_id, payload.tax_year, payload.entity_type,
+            user_id, payload.tax_year, payload.entity_type,
             payload.officer_wages, db
         )
     except Exception as e:
