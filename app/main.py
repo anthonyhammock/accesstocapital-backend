@@ -261,6 +261,40 @@ def categorize_merchant(merchant: str, db: Session) -> dict:
 
 ACCOUNTS_PER_BUREAU_SET = 3
 ADDITIONAL_BUSINESS_MONTHLY_FEE = Decimal('50.00')
+CONSUMER_MONTHLY_FEE = Decimal('10.00')
+
+def mask_ein(ein: str | None) -> str | None:
+    """Show only the last 4 digits — never return a full EIN over the API."""
+    if not ein:
+        return None
+    digits = re.sub(r'\D', '', ein)
+    if len(digits) < 4:
+        return 'XX-XXXXXXX'
+    return f"XX-XXX{digits[-4:]}"
+
+def mask_account_number(number: str | None) -> str | None:
+    """Show only the last 4 characters of an account number."""
+    if not number:
+        return None
+    if len(number) <= 4:
+        return '•' * len(number)
+    return '•' * (len(number) - 4) + number[-4:]
+
+def sync_account_type(user: User, db: Session):
+    """Recompute account_type from what the user actually has (rather than only
+    what they picked at signup), so it never drifts out of sync after adding a
+    business or a personal account later."""
+    has_consumer = db.query(ConsumerAccount).filter(ConsumerAccount.user_id == user.id).first() is not None
+    has_business = db.query(BusinessAccount).filter(BusinessAccount.user_id == user.id).first() is not None
+
+    if has_consumer and has_business:
+        user.account_type = 'both'
+    elif has_business:
+        user.account_type = 'business'
+    elif has_consumer:
+        user.account_type = 'consumer'
+
+    db.commit()
 
 def provision_business_accounts(user_id: int, business_name: str, ein: str, business_type: str, annual_revenue, db: Session) -> str:
     """Create one business's set of tradeline accounts, tagged with a shared
@@ -354,6 +388,22 @@ async def login(payload: LoginRequest, db: Session = Depends(get_db)):
     }
 
 
+@app.get("/api/me")
+async def get_me(user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    """Fresh account info, not the possibly-stale copy cached in the frontend's
+    localStorage from login — account_type in particular can change any time a
+    business or personal account is added later."""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    return {
+        'id': user.id,
+        'email': user.email,
+        'first_name': user.first_name,
+        'last_name': user.last_name,
+        'account_type': user.account_type
+    }
+
 @app.get("/api/consumer-accounts")
 async def get_consumer_accounts(user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
     accounts = db.query(ConsumerAccount).filter(ConsumerAccount.user_id == user_id).all()
@@ -362,13 +412,39 @@ async def get_consumer_accounts(user_id: int = Depends(get_current_user_id), db:
             {
                 'id': a.id,
                 'account_name': a.account_name,
+                'account_number': mask_account_number(a.account_number),
                 'credit_limit': float(a.credit_limit) if a.credit_limit is not None else None,
                 'current_balance': float(a.current_balance) if a.current_balance is not None else None,
-                'payment_status': a.payment_status
+                'payment_status': a.payment_status,
+                'reported_to_bureaus': a.reported_to_bureaus
             }
             for a in accounts
         ]
     }
+
+@app.post("/api/consumer-accounts")
+async def add_consumer_account(user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    """Add personal credit-building to an account that doesn't have it yet — the
+    consumer-side counterpart to /api/businesses. Unlike businesses, a person
+    only needs one set of these, so this is a one-time addition, not something
+    you can repeat once you already have one."""
+    existing = db.query(ConsumerAccount).filter(ConsumerAccount.user_id == user_id).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="You already have a personal credit builder account.")
+
+    for i in range(1, ACCOUNTS_PER_BUREAU_SET + 1):
+        db.add(ConsumerAccount(
+            user_id=user_id,
+            account_name=f"Credit Builder Account {i}",
+            current_balance=Decimal(0),
+            reported_to_bureaus=False
+        ))
+    db.commit()
+
+    user = db.query(User).filter(User.id == user_id).first()
+    sync_account_type(user, db)
+
+    return {'status': 'success', 'monthly_fee': float(CONSUMER_MONTHLY_FEE)}
 
 @app.get("/api/business-accounts")
 async def get_business_accounts(user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
@@ -378,9 +454,10 @@ async def get_business_accounts(user_id: int = Depends(get_current_user_id), db:
             {
                 'id': a.id,
                 'business_name': a.business_name,
-                'ein': a.ein,
+                'ein': mask_ein(a.ein),
                 'credit_limit': float(a.credit_limit) if a.credit_limit is not None else None,
-                'current_balance': float(a.current_balance) if a.current_balance is not None else None
+                'current_balance': float(a.current_balance) if a.current_balance is not None else None,
+                'reported_to_bureaus': a.reported_to_bureaus
             }
             for a in accounts
         ]
@@ -399,7 +476,7 @@ async def get_businesses(user_id: int = Depends(get_current_user_id), db: Sessio
             groups[key] = {
                 'business_group_id': a.business_group_id,
                 'business_name': a.business_name,
-                'ein': a.ein,
+                'ein': mask_ein(a.ein),
                 'business_type': a.business_type,
                 'annual_revenue': float(a.annual_revenue) if a.annual_revenue is not None else None,
                 'monthly_fee': float(ADDITIONAL_BUSINESS_MONTHLY_FEE),
@@ -426,6 +503,7 @@ async def add_business(payload: AddBusinessRequest, user_id: int = Depends(get_c
         user.id, payload.business_name, payload.ein, payload.business_type, payload.annual_revenue, db
     )
     db.commit()
+    sync_account_type(user, db)
 
     return {
         'status': 'success',
