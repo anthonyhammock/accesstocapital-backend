@@ -259,7 +259,17 @@ class Signal(Base):
     stop_loss = Column(Numeric(14, 4), nullable=True)
     risk_reward_ratio = Column(Numeric(6, 2), nullable=True)
     reason = Column(Text, nullable=True)
+    explanation = Column(JSON, nullable=True)  # list of plain-language strings, beginner-friendly version of `reason`
     market_condition = Column(String(20), nullable=True)  # uptrend/downtrend/ranging
+
+    # Historical outcome tracking, resolved after the fact by checking real
+    # price action against target_price/stop_loss — this is what powers an
+    # honest, empirically-computed success rate (see /api/trading/success-rate)
+    # instead of confusing indicator-agreement confidence with a probability
+    # of profit, which are not the same thing.
+    outcome = Column(String(20), nullable=False, default='pending')  # pending/target_hit/stop_hit/expired
+    outcome_at = Column(DateTime, nullable=True)
+
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 class AlertPreference(Base):

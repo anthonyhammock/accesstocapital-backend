@@ -28,7 +28,7 @@ from sqlalchemy.exc import IntegrityError
 from app.database import get_db
 from app.models import WatchlistEntry, Signal, AlertPreference, SignalAlert, TradeLog, User
 from app.auth import get_current_user_id
-from app.market_data import fetch_ohlcv, is_market_data_configured
+from app.market_data import fetch_ohlcv, fetch_quote, is_market_data_configured
 from app.signal_engine import score_signal
 
 router = APIRouter(prefix="/api/trading")
@@ -39,6 +39,16 @@ DISCLAIMER = (
     "does not indicate future performance. Trading involves risk of loss; "
     "you are solely responsible for any trades you choose to execute."
 )
+
+# A pending signal that hasn't hit its target or stop within this window is
+# marked 'expired' rather than left open forever — old, stale signals
+# shouldn't stay "pending" indefinitely and skew the success-rate stats.
+SIGNAL_OUTCOME_EXPIRY_DAYS = 5
+
+# Bucketed purely for the historical success-rate report — has no effect on
+# signal generation itself (SIGNAL_CONFIDENCE_THRESHOLD in signal_engine.py
+# is the actual generation cutoff).
+CONFIDENCE_TIERS = [(65, 74), (75, 84), (85, 100)]
 
 VALID_TIMEFRAMES = {'5min', '15min', '1h', '1day'}
 VALID_STRATEGIES = {'momentum', 'mean_reversion', 'breakout', 'hybrid'}
@@ -139,7 +149,9 @@ def serialize_signal(s: Signal) -> dict:
         'stop_loss': float(s.stop_loss) if s.stop_loss is not None else None,
         'risk_reward_ratio': float(s.risk_reward_ratio) if s.risk_reward_ratio is not None else None,
         'reason': s.reason,
+        'explanation': s.explanation or [],
         'market_condition': s.market_condition,
+        'outcome': s.outcome,
         'created_at': s.created_at.isoformat() if s.created_at else None,
         'disclaimer': DISCLAIMER,
     }
@@ -167,6 +179,51 @@ def is_market_hours_now() -> bool:
         return False
     open_time, close_time = time_type(9, 30), time_type(16, 0)
     return open_time <= now_et.time() <= close_time
+
+def resolve_pending_signal_outcomes(db: Session) -> None:
+    """Checks every unresolved past signal against the current price and
+    marks it target_hit / stop_hit / expired. This is what makes the
+    success-rate report real (computed from what actually happened
+    afterward) instead of a guess — it costs one cheap quote call per
+    distinct pending symbol, not a full OHLCV fetch."""
+    pending = db.query(Signal).filter(Signal.outcome == 'pending').all()
+    if not pending:
+        return
+
+    now = datetime.utcnow()
+    expiry_cutoff = now - timedelta(days=SIGNAL_OUTCOME_EXPIRY_DAYS)
+    quote_cache: dict[str, float | None] = {}
+
+    for signal in pending:
+        if signal.symbol not in quote_cache:
+            quote_cache[signal.symbol] = fetch_quote(signal.symbol)
+        price = quote_cache[signal.symbol]
+
+        outcome = None
+        # target_price/stop_loss are nullable at the DB level; a row missing
+        # either can't be evaluated against price, but should still be
+        # eligible to expire rather than wedge this loop for every symbol.
+        if price is not None and signal.target_price is not None and signal.stop_loss is not None:
+            target, stop = float(signal.target_price), float(signal.stop_loss)
+            if signal.signal_type == 'buy':
+                if price >= target:
+                    outcome = 'target_hit'
+                elif price <= stop:
+                    outcome = 'stop_hit'
+            else:
+                if price <= target:
+                    outcome = 'target_hit'
+                elif price >= stop:
+                    outcome = 'stop_hit'
+
+        if outcome is None and signal.created_at and signal.created_at <= expiry_cutoff:
+            outcome = 'expired'
+
+        if outcome:
+            signal.outcome = outcome
+            signal.outcome_at = now
+
+    db.commit()
 
 def is_quiet_hours(pref: AlertPreference, now_utc: datetime) -> bool:
     if not pref.quiet_hours_start or not pref.quiet_hours_end:
@@ -464,6 +521,49 @@ async def get_performance(user_id: int = Depends(get_current_user_id), db: Sessi
         'worst_trade': float(min((t.pnl for t in closed if t.pnl is not None), default=0)) if closed else None,
     }
 
+@router.get("/success-rate")
+async def get_success_rate(user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    """An honest, empirically-computed historical hit rate — NOT a
+    per-signal probability of success. Confidence (in each signal's own
+    payload) measures how many indicators agreed; this measures what
+    actually happened afterward to past signals, system-wide, bucketed by
+    that same confidence score. Small sample sizes are flagged rather than
+    hidden behind a single misleading percentage."""
+    signals = db.query(Signal).filter(Signal.outcome.in_(['target_hit', 'stop_hit', 'expired'])).all()
+
+    def tier_stats(lo: int, hi: int) -> dict:
+        tier_signals = [s for s in signals if lo <= s.confidence <= hi]
+        resolved = [s for s in tier_signals if s.outcome in ('target_hit', 'stop_hit')]
+        hits = [s for s in resolved if s.outcome == 'target_hit']
+        return {
+            'confidence_range': f'{lo}-{hi}%',
+            'sample_size': len(resolved),
+            'hit_rate': round(len(hits) / len(resolved) * 100, 1) if resolved else None,
+            'expired_count': len(tier_signals) - len(resolved),
+            '_hits': len(hits),
+        }
+
+    tiers = [tier_stats(lo, hi) for lo, hi in CONFIDENCE_TIERS]
+    # Derived as a sum of the tiers (rather than independently filtered from
+    # `signals`) so `overall` can never drift from the tier breakdown even if
+    # SIGNAL_CONFIDENCE_THRESHOLD is ever changed without updating
+    # CONFIDENCE_TIERS to match — a signal outside every tier's range simply
+    # doesn't count anywhere, instead of inflating `overall` invisibly.
+    overall_resolved = sum(t['sample_size'] for t in tiers)
+    overall_hits = sum(t.pop('_hits') for t in tiers)
+
+    return {
+        'overall': {
+            'sample_size': overall_resolved,
+            'hit_rate': round(overall_hits / overall_resolved * 100, 1) if overall_resolved else None,
+        },
+        'by_confidence_tier': tiers,
+        'disclaimer': (
+            "Historical results across all past signals system-wide — not a prediction for any "
+            "individual future signal. Small sample sizes are not statistically reliable."
+        ),
+    }
+
 
 # ============================================
 # Signal generation job (Cloud Scheduler -> here every 5 min)
@@ -480,6 +580,8 @@ async def generate_signals(x_cron_secret: str | None = Header(default=None), db:
         return {'status': 'skipped', 'reason': 'outside market hours (9:30-16:00 ET, Mon-Fri)'}
     if not is_market_data_configured():
         return {'status': 'skipped', 'reason': 'market data provider not configured'}
+
+    resolve_pending_signal_outcomes(db)
 
     pairs = db.query(WatchlistEntry.symbol, WatchlistEntry.timeframe).filter(
         WatchlistEntry.is_active == True

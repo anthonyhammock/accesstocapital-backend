@@ -54,3 +54,21 @@ def fetch_ohlcv(symbol: str, timeframe: str, count: int = 100) -> dict | None:
         }
     except Exception:
         return None
+
+
+def fetch_quote(symbol: str) -> float | None:
+    """Current price only — much cheaper than a full OHLCV fetch, used to
+    check whether a past signal's target or stop has since been hit."""
+    if not FINNHUB_API_KEY:
+        return None
+    try:
+        resp = requests.get(
+            'https://finnhub.io/api/v1/quote',
+            params={'symbol': symbol, 'token': FINNHUB_API_KEY},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        price = resp.json().get('c')
+        return float(price) if price else None
+    except Exception:
+        return None
