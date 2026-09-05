@@ -129,6 +129,11 @@ class PortalClient(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     name = Column(String(255), nullable=False)
     email = Column(String(255), nullable=True)
+    # Generically useful beyond Client Portal now that this doubles as the
+    # platform-wide Contact record (also used by Invoicing and CRM) —
+    # nullable so nothing that only ever set name/email/notes breaks.
+    phone = Column(String(50), nullable=True)
+    company = Column(String(255), nullable=True)
     notes = Column(Text, nullable=True)
 
     # Unguessable magic-link token (secrets.token_urlsafe(32)) — this is the
@@ -436,6 +441,43 @@ class InvoicePayment(Base):
     payment_method = Column(String(20), nullable=False, default='other')  # check/ach/card/wire/cash/other
     reference_number = Column(String(100), nullable=True)
     notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class Deal(Base):
+    __tablename__ = "deals"
+
+    # Reuses PortalClient as the contact, same as Invoicing — one contact
+    # list across Client Portal, Invoicing, and the CRM pipeline.
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    client_id = Column(Integer, ForeignKey("portal_clients.id"), nullable=False, index=True)
+    title = Column(String(255), nullable=False)
+    # Numeric(12, 2) to match InvoiceLineItem.unit_price — a deal converts
+    # straight into a line item, so the two must share the same precision
+    # or a large deal value overflows the invoice line item column.
+    value = Column(Numeric(12, 2), nullable=False, default=0)
+    stage = Column(String(20), nullable=False, default='lead', index=True)  # lead/qualified/proposal/negotiation/won/lost
+    expected_close_date = Column(DateTime, nullable=True)
+    notes = Column(Text, nullable=True)
+
+    # Set when stage moves to won/lost, cleared if reopened to an active
+    # stage — lets the pipeline distinguish "just created" from "closed
+    # a while ago" without a second parallel status field.
+    closed_at = Column(DateTime, nullable=True)
+
+    # Set once a won deal is converted to an invoice — blocks converting
+    # the same deal twice into two separate invoices.
+    invoice_id = Column(Integer, ForeignKey("invoices.id"), nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class DealNote(Base):
+    __tablename__ = "deal_notes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    deal_id = Column(Integer, ForeignKey("deals.id"), nullable=False, index=True)
+    body = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class TaxSummary(Base):
