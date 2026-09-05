@@ -628,7 +628,7 @@ async def list_bookkeeping_transactions(
     db: Session = Depends(get_db)
 ):
     query = db.query(Transaction).filter(Transaction.user_id == user_id)
-    if year:
+    if year is not None:
         query = query.filter(extract('year', Transaction.transaction_date) == year)
     txs = query.order_by(Transaction.transaction_date.desc()).all()
     return {'transactions': [serialize_transaction(t) for t in txs]}
@@ -715,7 +715,7 @@ async def bookkeeping_summary(
     db: Session = Depends(get_db)
 ):
     query = db.query(Transaction).filter(Transaction.user_id == user_id)
-    if year:
+    if year is not None:
         query = query.filter(extract('year', Transaction.transaction_date) == year)
     txs = query.all()
 
@@ -736,7 +736,7 @@ async def export_bookkeeping_csv(
     db: Session = Depends(get_db)
 ):
     query = db.query(Transaction).filter(Transaction.user_id == user_id)
-    if year:
+    if year is not None:
         query = query.filter(extract('year', Transaction.transaction_date) == year)
     txs = query.order_by(Transaction.transaction_date).all()
 
@@ -754,6 +754,80 @@ async def export_bookkeeping_csv(
         ])
 
     filename = f"bookkeeping-{year or 'all'}.csv"
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+# ============================================
+# P&L STATEMENT
+# Built entirely from the bookkeeping ledger above — same
+# Depends(get_current_user_id) scoping, no new trust surface.
+# ============================================
+
+def compute_profit_and_loss(user_id: int, year: int | None, db: Session) -> dict:
+    query = db.query(Transaction).filter(Transaction.user_id == user_id)
+    if year is not None:
+        query = query.filter(extract('year', Transaction.transaction_date) == year)
+    txs = query.all()
+
+    rule_names = {r.deduction_code: r.deduction_name for r in db.query(DeductionRule).all()}
+
+    revenue_total = Decimal(0)
+    expense_total = Decimal(0)
+    expense_by_category = {}
+
+    for t in txs:
+        if t.transaction_type == 'income':
+            revenue_total += t.amount
+        elif t.transaction_type == 'expense':
+            expense_total += t.amount
+            label = rule_names.get(t.deduction_code, 'Uncategorized') if t.deduction_code else 'Uncategorized'
+            expense_by_category[label] = expense_by_category.get(label, Decimal(0)) + t.amount
+
+    by_category = sorted(
+        ({'label': k, 'total': float(v)} for k, v in expense_by_category.items()),
+        key=lambda row: -row['total']
+    )
+
+    return {
+        'year': year,
+        'revenue': {'total': float(revenue_total)},
+        'expenses': {'total': float(expense_total), 'by_category': by_category},
+        'net_income': float(revenue_total - expense_total)
+    }
+
+@app.get("/api/reports/profit-and-loss")
+async def profit_and_loss(
+    year: int | None = None,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db)
+):
+    return compute_profit_and_loss(user_id, year, db)
+
+@app.get("/api/reports/profit-and-loss/export")
+async def export_profit_and_loss_csv(
+    year: int | None = None,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db)
+):
+    report = compute_profit_and_loss(user_id, year, db)
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([f"Profit & Loss Statement — {year or 'All Years'}"])
+    writer.writerow([])
+    writer.writerow(['Revenue', f"{report['revenue']['total']:.2f}"])
+    writer.writerow([])
+    writer.writerow(['Expenses'])
+    for row in report['expenses']['by_category']:
+        writer.writerow([f"  {row['label']}", f"{row['total']:.2f}"])
+    writer.writerow(['Total Expenses', f"{report['expenses']['total']:.2f}"])
+    writer.writerow([])
+    writer.writerow(['Net Income', f"{report['net_income']:.2f}"])
+
+    filename = f"profit-and-loss-{year or 'all'}.csv"
     return StreamingResponse(
         iter([output.getvalue()]),
         media_type="text/csv",
