@@ -24,3 +24,12 @@
   that are popular, in high demand, and that work efficiently over
   exhaustive feature parity; strip away anything unnecessary rather than
   bolting it on.
+- Competitive benchmarking method (apply to every tool, built or planned):
+  identify at least 3 top competitors in that tool's category (e.g. Project
+  Management -> Asana/Wrike/Trello; CRM -> Salesforce/HubSpot/Pipedrive),
+  confirm the tool covers their core, table-stakes functions, then go
+  further — combine multiple competitors' popular features into one
+  coherent tool rather than picking just one to copy, and look for a
+  feature none of them offer but plausibly should. The bar is "why would
+  someone use this over the dedicated tool," not "does this technically do
+  the job."
