@@ -208,6 +208,28 @@ class Booking(Base):
     status = Column(String(20), nullable=False, default='confirmed')  # 'confirmed' or 'cancelled'
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class CalendarConnection(Base):
+    __tablename__ = "calendar_connections"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+
+    # 'google' or 'microsoft'. A user can connect at most one of each
+    # (enforced by the app, not a DB constraint, so a future third provider
+    # doesn't need a schema change).
+    provider = Column(String(20), nullable=False)
+    provider_email = Column(String(255), nullable=True)
+
+    # Fernet-encrypted at rest (see encrypt_token/decrypt_token in main.py) —
+    # these are live credentials that can read someone's calendar, not
+    # ordinary app data, so they never touch the database in plaintext.
+    access_token_encrypted = Column(Text, nullable=False)
+    refresh_token_encrypted = Column(Text, nullable=False)
+    token_expires_at = Column(DateTime, nullable=False)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
 class TaxSummary(Base):
     __tablename__ = "tax_summaries"
 

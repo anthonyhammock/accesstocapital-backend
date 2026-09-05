@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, RedirectResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import text, extract, func
 from sqlalchemy.exc import IntegrityError
@@ -16,14 +16,16 @@ import re
 import secrets
 import urllib.parse
 import uuid
+import requests
+from cryptography.fernet import Fernet
 
 from app.database import get_db, engine
 from app.models import (
     Base, DeductionRule, CategorizationRule, Transaction, TaxSummary, User,
     ConsumerAccount, BusinessAccount, PortalClient, PortalDocument, PortalComment,
-    SchedulingSettings, AvailabilityRule, Booking,
+    SchedulingSettings, AvailabilityRule, Booking, CalendarConnection,
 )
-from app.auth import create_access_token, get_current_user_id
+from app.auth import create_access_token, get_current_user_id, create_oauth_state_token, verify_oauth_state_token
 import bcrypt
 
 app = FastAPI(title="BlissPoint Tax & Credit", version="1.0.0")
@@ -1464,6 +1466,7 @@ def compute_available_slots(settings: SchedulingSettings, db: Session) -> list[d
         (b.start_at.replace(tzinfo=timezone.utc), b.end_at.replace(tzinfo=timezone.utc))
         for b in existing
     ]
+    existing_intervals.extend(get_external_busy_intervals(settings, now_utc, window_end, db))
 
     duration = timedelta(minutes=settings.meeting_duration_minutes)
     step = timedelta(minutes=settings.meeting_duration_minutes + settings.buffer_minutes)
@@ -1642,6 +1645,342 @@ async def book_public_slot(slug: str, payload: BookingCreate, db: Session = Depe
     db.commit()
     db.refresh(booking)
     return serialize_booking(booking)
+
+# ============================================
+# CALENDAR SYNC (Google / Microsoft — read-only busy-time blocking)
+# ============================================
+# An owner connects an outside calendar via OAuth; we only ever read its
+# busy/free time (never create, edit, or delete anything on it) and
+# subtract those busy blocks from compute_available_slots, so the booking
+# page can't offer a time the owner is actually unavailable for elsewhere.
+#
+# All of GOOGLE_CLIENT_ID/SECRET, MICROSOFT_CLIENT_ID/SECRET, and
+# CALENDAR_TOKEN_ENCRYPTION_KEY are optional at startup on purpose — this
+# feature ships disabled until real OAuth app credentials exist, without
+# taking the rest of the API down for everything else in the meantime.
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CALENDAR_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CALENDAR_CLIENT_SECRET")
+MICROSOFT_CLIENT_ID = os.environ.get("MICROSOFT_CALENDAR_CLIENT_ID")
+MICROSOFT_CLIENT_SECRET = os.environ.get("MICROSOFT_CALENDAR_CLIENT_SECRET")
+CALENDAR_TOKEN_ENCRYPTION_KEY = os.environ.get("CALENDAR_TOKEN_ENCRYPTION_KEY")
+
+# Must exactly match what's registered as the OAuth redirect URI with each
+# provider, and where the browser lands after a successful/failed connect.
+BACKEND_BASE_URL = os.environ.get("BACKEND_BASE_URL", "http://localhost:8000")
+FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "http://localhost:3000")
+
+GOOGLE_REDIRECT_URI = f"{BACKEND_BASE_URL}/api/scheduling/calendar/callback/google"
+MICROSOFT_REDIRECT_URI = f"{BACKEND_BASE_URL}/api/scheduling/calendar/callback/microsoft"
+
+
+def get_token_fernet() -> Fernet:
+    if not CALENDAR_TOKEN_ENCRYPTION_KEY:
+        raise HTTPException(status_code=503, detail="Calendar sync is not configured on this server yet.")
+    try:
+        return Fernet(CALENDAR_TOKEN_ENCRYPTION_KEY.encode())
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=503, detail="Calendar sync is misconfigured on this server.")
+
+def encrypt_token(value: str) -> str:
+    return get_token_fernet().encrypt(value.encode()).decode()
+
+def decrypt_token(value: str) -> str:
+    return get_token_fernet().decrypt(value.encode()).decode()
+
+def upsert_calendar_connection(
+    user_id: int, provider: str, email: str | None,
+    access_token: str, refresh_token: str, expires_in: int, db: Session
+) -> None:
+    connection = db.query(CalendarConnection).filter(
+        CalendarConnection.user_id == user_id, CalendarConnection.provider == provider
+    ).first()
+    if not connection:
+        connection = CalendarConnection(user_id=user_id, provider=provider)
+        db.add(connection)
+    connection.provider_email = email
+    connection.access_token_encrypted = encrypt_token(access_token)
+    connection.refresh_token_encrypted = encrypt_token(refresh_token)
+    connection.token_expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+    db.commit()
+
+def get_valid_google_access_token(connection: CalendarConnection, db: Session) -> str:
+    if connection.token_expires_at > datetime.utcnow() + timedelta(minutes=2):
+        return decrypt_token(connection.access_token_encrypted)
+
+    resp = requests.post('https://oauth2.googleapis.com/token', data={
+        'client_id': GOOGLE_CLIENT_ID,
+        'client_secret': GOOGLE_CLIENT_SECRET,
+        'refresh_token': decrypt_token(connection.refresh_token_encrypted),
+        'grant_type': 'refresh_token',
+    }, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    connection.access_token_encrypted = encrypt_token(data['access_token'])
+    connection.token_expires_at = datetime.utcnow() + timedelta(seconds=data.get('expires_in', 3600))
+    db.commit()
+    return data['access_token']
+
+def get_valid_microsoft_access_token(connection: CalendarConnection, db: Session) -> str:
+    if connection.token_expires_at > datetime.utcnow() + timedelta(minutes=2):
+        return decrypt_token(connection.access_token_encrypted)
+
+    resp = requests.post('https://login.microsoftonline.com/common/oauth2/v2.0/token', data={
+        'client_id': MICROSOFT_CLIENT_ID,
+        'client_secret': MICROSOFT_CLIENT_SECRET,
+        'refresh_token': decrypt_token(connection.refresh_token_encrypted),
+        'grant_type': 'refresh_token',
+        'scope': 'offline_access Calendars.Read User.Read',
+    }, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    connection.access_token_encrypted = encrypt_token(data['access_token'])
+    # Microsoft rotates refresh tokens on use; if a new one comes back, the
+    # old one stops working, so we must store the replacement or the next
+    # refresh attempt fails with an unrecoverable invalid_grant.
+    if data.get('refresh_token'):
+        connection.refresh_token_encrypted = encrypt_token(data['refresh_token'])
+    connection.token_expires_at = datetime.utcnow() + timedelta(seconds=data.get('expires_in', 3600))
+    db.commit()
+    return data['access_token']
+
+def fetch_google_busy_intervals(connection: CalendarConnection, time_min: datetime, time_max: datetime, db: Session) -> list[tuple[datetime, datetime]]:
+    try:
+        access_token = get_valid_google_access_token(connection, db)
+        resp = requests.post(
+            'https://www.googleapis.com/calendar/v3/freeBusy',
+            headers={'Authorization': f'Bearer {access_token}'},
+            json={
+                'timeMin': time_min.isoformat(),
+                'timeMax': time_max.isoformat(),
+                'items': [{'id': 'primary'}],
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        busy = resp.json().get('calendars', {}).get('primary', {}).get('busy', [])
+        return [
+            (
+                datetime.fromisoformat(b['start'].replace('Z', '+00:00')),
+                datetime.fromisoformat(b['end'].replace('Z', '+00:00')),
+            )
+            for b in busy
+        ]
+    except Exception:
+        # A connected calendar that's temporarily unreachable (expired grant,
+        # network hiccup, provider outage) shouldn't take the booking page
+        # down for every visitor — worst case we show a slot the owner would
+        # rather have hidden, not a 500.
+        return []
+
+def fetch_microsoft_busy_intervals(connection: CalendarConnection, time_min: datetime, time_max: datetime, db: Session) -> list[tuple[datetime, datetime]]:
+    # getSchedule's "schedules" array takes real mailbox addresses, not the
+    # "me" path-segment convention used elsewhere in Graph — there's no
+    # valid value to send without a known address, so degrade to no busy
+    # data rather than sending a request that looks plausible but silently
+    # queries the wrong (or no) mailbox.
+    if not connection.provider_email:
+        return []
+
+    try:
+        access_token = get_valid_microsoft_access_token(connection, db)
+        resp = requests.post(
+            'https://graph.microsoft.com/v1.0/me/calendar/getSchedule',
+            headers={'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'},
+            json={
+                'schedules': [connection.provider_email],
+                'startTime': {'dateTime': time_min.strftime('%Y-%m-%dT%H:%M:%S'), 'timeZone': 'UTC'},
+                'endTime': {'dateTime': time_max.strftime('%Y-%m-%dT%H:%M:%S'), 'timeZone': 'UTC'},
+                'availabilityViewInterval': 30,
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        schedules = resp.json().get('value', [])
+        intervals = []
+        for schedule in schedules:
+            for item in schedule.get('scheduleItems', []):
+                if item.get('status') == 'free':
+                    continue
+                start = datetime.fromisoformat(item['start']['dateTime']).replace(tzinfo=timezone.utc)
+                end = datetime.fromisoformat(item['end']['dateTime']).replace(tzinfo=timezone.utc)
+                intervals.append((start, end))
+        return intervals
+    except Exception:
+        return []
+
+def get_external_busy_intervals(settings: SchedulingSettings, time_min: datetime, time_max: datetime, db: Session) -> list[tuple[datetime, datetime]]:
+    if not CALENDAR_TOKEN_ENCRYPTION_KEY:
+        return []
+    connections = db.query(CalendarConnection).filter(CalendarConnection.user_id == settings.user_id).all()
+    intervals = []
+    for connection in connections:
+        if connection.provider == 'google':
+            intervals.extend(fetch_google_busy_intervals(connection, time_min, time_max, db))
+        elif connection.provider == 'microsoft':
+            intervals.extend(fetch_microsoft_busy_intervals(connection, time_min, time_max, db))
+    return intervals
+
+@app.get("/api/scheduling/calendar/providers")
+async def get_calendar_providers(user_id: int = Depends(get_current_user_id)):
+    return {
+        'google': bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and CALENDAR_TOKEN_ENCRYPTION_KEY),
+        'microsoft': bool(MICROSOFT_CLIENT_ID and MICROSOFT_CLIENT_SECRET and CALENDAR_TOKEN_ENCRYPTION_KEY),
+    }
+
+@app.get("/api/scheduling/calendar/connections")
+async def list_calendar_connections(user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    connections = db.query(CalendarConnection).filter(CalendarConnection.user_id == user_id).all()
+    return {
+        'connections': [
+            {
+                'id': c.id,
+                'provider': c.provider,
+                'provider_email': c.provider_email,
+                'connected_at': c.created_at.isoformat() if c.created_at else None,
+            }
+            for c in connections
+        ]
+    }
+
+@app.delete("/api/scheduling/calendar/connections/{connection_id}")
+async def disconnect_calendar(connection_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    connection = db.query(CalendarConnection).filter(
+        CalendarConnection.id == connection_id, CalendarConnection.user_id == user_id
+    ).first()
+    if not connection:
+        raise HTTPException(status_code=404, detail="Calendar connection not found.")
+    db.delete(connection)
+    db.commit()
+    return {'status': 'success'}
+
+@app.get("/api/scheduling/calendar/connect/google")
+async def connect_google_calendar(user_id: int = Depends(get_current_user_id)):
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and CALENDAR_TOKEN_ENCRYPTION_KEY):
+        raise HTTPException(status_code=503, detail="Google Calendar sync is not configured on this server yet.")
+    state = create_oauth_state_token(user_id, 'google')
+    params = {
+        'client_id': GOOGLE_CLIENT_ID,
+        'redirect_uri': GOOGLE_REDIRECT_URI,
+        'response_type': 'code',
+        'scope': 'openid email https://www.googleapis.com/auth/calendar.freebusy',
+        'access_type': 'offline',
+        'prompt': 'consent',
+        'state': state,
+    }
+    return {'authorization_url': f'https://accounts.google.com/o/oauth2/v2/auth?{urllib.parse.urlencode(params)}'}
+
+@app.get("/api/scheduling/calendar/callback/google")
+async def google_calendar_callback(
+    code: str | None = None, state: str | None = None, error: str | None = None,
+    db: Session = Depends(get_db)
+):
+    if error or not code or not state:
+        return RedirectResponse(f'{FRONTEND_BASE_URL}/tools/scheduling?calendar_error=google')
+
+    try:
+        user_id = verify_oauth_state_token(state, 'google')
+    except HTTPException:
+        # A raw 400 here would land a real user (whose consent screen took
+        # too long, or who double-clicked "Connect" and used a stale link)
+        # on a bare error page instead of back in the app — every other
+        # failure in this flow redirects with calendar_error, so this
+        # should too.
+        return RedirectResponse(f'{FRONTEND_BASE_URL}/tools/scheduling?calendar_error=google')
+
+    try:
+        token_resp = requests.post('https://oauth2.googleapis.com/token', data={
+            'client_id': GOOGLE_CLIENT_ID,
+            'client_secret': GOOGLE_CLIENT_SECRET,
+            'code': code,
+            'grant_type': 'authorization_code',
+            'redirect_uri': GOOGLE_REDIRECT_URI,
+        }, timeout=10)
+        token_resp.raise_for_status()
+        token_data = token_resp.json()
+
+        if 'refresh_token' not in token_data:
+            # We always pass prompt=consent above specifically so Google
+            # always issues one — if it's still missing, something's wrong
+            # enough that we shouldn't save a connection we can never renew.
+            return RedirectResponse(f'{FRONTEND_BASE_URL}/tools/scheduling?calendar_error=google')
+
+        userinfo_resp = requests.get(
+            'https://www.googleapis.com/oauth2/v2/userinfo',
+            headers={'Authorization': f"Bearer {token_data['access_token']}"}, timeout=10
+        )
+        userinfo_resp.raise_for_status()
+        email = userinfo_resp.json().get('email')
+
+        upsert_calendar_connection(
+            user_id, 'google', email,
+            token_data['access_token'], token_data['refresh_token'],
+            token_data.get('expires_in', 3600), db
+        )
+    except Exception:
+        return RedirectResponse(f'{FRONTEND_BASE_URL}/tools/scheduling?calendar_error=google')
+
+    return RedirectResponse(f'{FRONTEND_BASE_URL}/tools/scheduling?calendar_connected=google')
+
+@app.get("/api/scheduling/calendar/connect/microsoft")
+async def connect_microsoft_calendar(user_id: int = Depends(get_current_user_id)):
+    if not (MICROSOFT_CLIENT_ID and MICROSOFT_CLIENT_SECRET and CALENDAR_TOKEN_ENCRYPTION_KEY):
+        raise HTTPException(status_code=503, detail="Microsoft Calendar sync is not configured on this server yet.")
+    state = create_oauth_state_token(user_id, 'microsoft')
+    params = {
+        'client_id': MICROSOFT_CLIENT_ID,
+        'redirect_uri': MICROSOFT_REDIRECT_URI,
+        'response_type': 'code',
+        'response_mode': 'query',
+        'scope': 'offline_access Calendars.Read User.Read',
+        'state': state,
+    }
+    return {'authorization_url': f'https://login.microsoftonline.com/common/oauth2/v2.0/authorize?{urllib.parse.urlencode(params)}'}
+
+@app.get("/api/scheduling/calendar/callback/microsoft")
+async def microsoft_calendar_callback(
+    code: str | None = None, state: str | None = None, error: str | None = None,
+    db: Session = Depends(get_db)
+):
+    if error or not code or not state:
+        return RedirectResponse(f'{FRONTEND_BASE_URL}/tools/scheduling?calendar_error=microsoft')
+
+    try:
+        user_id = verify_oauth_state_token(state, 'microsoft')
+    except HTTPException:
+        return RedirectResponse(f'{FRONTEND_BASE_URL}/tools/scheduling?calendar_error=microsoft')
+
+    try:
+        token_resp = requests.post('https://login.microsoftonline.com/common/oauth2/v2.0/token', data={
+            'client_id': MICROSOFT_CLIENT_ID,
+            'client_secret': MICROSOFT_CLIENT_SECRET,
+            'code': code,
+            'grant_type': 'authorization_code',
+            'redirect_uri': MICROSOFT_REDIRECT_URI,
+            'scope': 'offline_access Calendars.Read User.Read',
+        }, timeout=10)
+        token_resp.raise_for_status()
+        token_data = token_resp.json()
+
+        if 'refresh_token' not in token_data:
+            return RedirectResponse(f'{FRONTEND_BASE_URL}/tools/scheduling?calendar_error=microsoft')
+
+        me_resp = requests.get(
+            'https://graph.microsoft.com/v1.0/me',
+            headers={'Authorization': f"Bearer {token_data['access_token']}"}, timeout=10
+        )
+        me_resp.raise_for_status()
+        me = me_resp.json()
+        email = me.get('mail') or me.get('userPrincipalName')
+
+        upsert_calendar_connection(
+            user_id, 'microsoft', email,
+            token_data['access_token'], token_data['refresh_token'],
+            token_data.get('expires_in', 3600), db
+        )
+    except Exception:
+        return RedirectResponse(f'{FRONTEND_BASE_URL}/tools/scheduling?calendar_error=microsoft')
+
+    return RedirectResponse(f'{FRONTEND_BASE_URL}/tools/scheduling?calendar_connected=microsoft')
 
 # ============================================
 # HEALTH
