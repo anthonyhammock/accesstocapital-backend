@@ -1,8 +1,9 @@
 from fastapi import FastAPI, Depends, HTTPException, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import text, extract
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from decimal import Decimal
 import csv
 import io
@@ -74,6 +75,27 @@ class QuestionnaireSubmission(BaseModel):
     entity_type: str
     answers: list[QuestionnaireAnswer]
     officer_wages: Decimal = Decimal(0)
+
+# Numeric(12,2) tops out at 10 integer digits; amount must be positive —
+# the sign is carried by transaction_type, not the amount itself, so a
+# negative amount would silently corrupt the income/expense/net totals.
+MAX_TRANSACTION_AMOUNT = Decimal('9999999999.99')
+
+class TransactionCreate(BaseModel):
+    transaction_date: str  # 'YYYY-MM-DD'
+    merchant_name: str
+    amount: Decimal = Field(gt=0, le=MAX_TRANSACTION_AMOUNT)
+    transaction_type: str = 'expense'  # 'income' or 'expense'
+    deduction_code: str = None
+    description: str = None
+
+class TransactionUpdate(BaseModel):
+    transaction_date: str = None
+    merchant_name: str = None
+    amount: Decimal | None = Field(default=None, gt=0, le=MAX_TRANSACTION_AMOUNT)
+    transaction_type: str = None
+    deduction_code: str = None
+    description: str = None
 
 # ============================================
 # QUESTIONNAIRE TEXT — plain language, no tax jargon
@@ -568,6 +590,175 @@ async def calculate(payload: CalculationRequest, user_id: int = Depends(get_curr
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
+
+# ============================================
+# BOOKKEEPING & EXPENSE MANAGEMENT
+# Every endpoint here is scoped to Depends(get_current_user_id) — list/summary/
+# export filter by it, and update/delete additionally re-check
+# Transaction.user_id == user_id on the fetched row so one account can never
+# read or modify another's ledger even by guessing a transaction id.
+# ============================================
+
+VALID_TRANSACTION_TYPES = ('income', 'expense')
+
+def parse_tx_date(date_str: str) -> datetime:
+    try:
+        return datetime.strptime(date_str, '%Y-%m-%d')
+    except ValueError:
+        raise HTTPException(status_code=400, detail="transaction_date must be in YYYY-MM-DD format.")
+
+def serialize_transaction(t: Transaction) -> dict:
+    return {
+        'id': t.id,
+        'date': t.transaction_date.strftime('%Y-%m-%d') if t.transaction_date else None,
+        'merchant': t.merchant_name,
+        'amount': float(t.amount),
+        'transaction_type': t.transaction_type,
+        'deduction_code': t.deduction_code,
+        'category': t.category,
+        'description': t.description,
+        'confidence': t.confidence_score,
+        'source': t.bank_csv_source,
+    }
+
+@app.get("/api/bookkeeping/transactions")
+async def list_bookkeeping_transactions(
+    year: int | None = None,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db)
+):
+    query = db.query(Transaction).filter(Transaction.user_id == user_id)
+    if year:
+        query = query.filter(extract('year', Transaction.transaction_date) == year)
+    txs = query.order_by(Transaction.transaction_date.desc()).all()
+    return {'transactions': [serialize_transaction(t) for t in txs]}
+
+@app.post("/api/bookkeeping/transactions")
+async def create_bookkeeping_transaction(
+    payload: TransactionCreate,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db)
+):
+    if payload.transaction_type not in VALID_TRANSACTION_TYPES:
+        raise HTTPException(status_code=400, detail="transaction_type must be 'income' or 'expense'.")
+
+    tx = Transaction(
+        user_id=user_id,
+        transaction_date=parse_tx_date(payload.transaction_date),
+        merchant_name=payload.merchant_name,
+        amount=payload.amount,
+        transaction_type=payload.transaction_type,
+        deduction_code=payload.deduction_code,
+        description=payload.description,
+        category='manual',
+        confidence_score=1.0
+    )
+    db.add(tx)
+    db.commit()
+    db.refresh(tx)
+    return {'status': 'success', 'transaction': serialize_transaction(tx)}
+
+@app.put("/api/bookkeeping/transactions/{transaction_id}")
+async def update_bookkeeping_transaction(
+    transaction_id: int,
+    payload: TransactionUpdate,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db)
+):
+    tx = db.query(Transaction).filter(
+        Transaction.id == transaction_id,
+        Transaction.user_id == user_id
+    ).first()
+    if not tx:
+        raise HTTPException(status_code=404, detail="Transaction not found.")
+
+    if payload.transaction_date is not None:
+        tx.transaction_date = parse_tx_date(payload.transaction_date)
+    if payload.merchant_name is not None:
+        tx.merchant_name = payload.merchant_name
+    if payload.amount is not None:
+        tx.amount = payload.amount
+    if payload.transaction_type is not None:
+        if payload.transaction_type not in VALID_TRANSACTION_TYPES:
+            raise HTTPException(status_code=400, detail="transaction_type must be 'income' or 'expense'.")
+        tx.transaction_type = payload.transaction_type
+    if payload.deduction_code is not None:
+        tx.deduction_code = payload.deduction_code
+    if payload.description is not None:
+        tx.description = payload.description
+
+    db.commit()
+    db.refresh(tx)
+    return {'status': 'success', 'transaction': serialize_transaction(tx)}
+
+@app.delete("/api/bookkeeping/transactions/{transaction_id}")
+async def delete_bookkeeping_transaction(
+    transaction_id: int,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db)
+):
+    tx = db.query(Transaction).filter(
+        Transaction.id == transaction_id,
+        Transaction.user_id == user_id
+    ).first()
+    if not tx:
+        raise HTTPException(status_code=404, detail="Transaction not found.")
+
+    db.delete(tx)
+    db.commit()
+    return {'status': 'success'}
+
+@app.get("/api/bookkeeping/summary")
+async def bookkeeping_summary(
+    year: int | None = None,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db)
+):
+    query = db.query(Transaction).filter(Transaction.user_id == user_id)
+    if year:
+        query = query.filter(extract('year', Transaction.transaction_date) == year)
+    txs = query.all()
+
+    income = sum((t.amount for t in txs if t.transaction_type == 'income'), Decimal(0))
+    expenses = sum((t.amount for t in txs if t.transaction_type == 'expense'), Decimal(0))
+
+    return {
+        'income': float(income),
+        'expenses': float(expenses),
+        'net': float(income - expenses),
+        'transaction_count': len(txs)
+    }
+
+@app.get("/api/bookkeeping/export")
+async def export_bookkeeping_csv(
+    year: int | None = None,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db)
+):
+    query = db.query(Transaction).filter(Transaction.user_id == user_id)
+    if year:
+        query = query.filter(extract('year', Transaction.transaction_date) == year)
+    txs = query.order_by(Transaction.transaction_date).all()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['Date', 'Merchant', 'Type', 'Category', 'Amount', 'Description'])
+    for t in txs:
+        writer.writerow([
+            t.transaction_date.strftime('%Y-%m-%d') if t.transaction_date else '',
+            t.merchant_name,
+            t.transaction_type,
+            t.deduction_code or t.category or '',
+            float(t.amount),
+            t.description or ''
+        ])
+
+    filename = f"bookkeeping-{year or 'all'}.csv"
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
 
 # ============================================
 # HEALTH

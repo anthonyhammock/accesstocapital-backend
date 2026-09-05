@@ -87,6 +87,12 @@ class Transaction(Base):
     amount = Column(Numeric(12, 2))
     description = Column(Text, nullable=True)
 
+    # 'income' or 'expense' — needed to total a ledger correctly; deduction_code
+    # alone can't tell the two apart since every deduction_rules row is an
+    # expense category. Defaults to 'expense' since that's what every existing
+    # row (CSV upload, questionnaire) already is.
+    transaction_type = Column(String(20), nullable=False, default='expense')
+
     deduction_code = Column(String(100), ForeignKey("deduction_rules.deduction_code"), nullable=True)
     category = Column(String(255), nullable=True)
     confidence_score = Column(Float, nullable=True)
