@@ -86,6 +86,7 @@ class TransactionCreate(BaseModel):
     merchant_name: str
     amount: Decimal = Field(gt=0, le=MAX_TRANSACTION_AMOUNT)
     transaction_type: str = 'expense'  # 'income' or 'expense'
+    cash_flow_category: str = 'operating'  # 'operating', 'investing', or 'financing'
     deduction_code: str = None
     description: str = None
 
@@ -94,6 +95,7 @@ class TransactionUpdate(BaseModel):
     merchant_name: str = None
     amount: Decimal | None = Field(default=None, gt=0, le=MAX_TRANSACTION_AMOUNT)
     transaction_type: str = None
+    cash_flow_category: str = None
     deduction_code: str = None
     description: str = None
 
@@ -600,6 +602,7 @@ async def calculate(payload: CalculationRequest, user_id: int = Depends(get_curr
 # ============================================
 
 VALID_TRANSACTION_TYPES = ('income', 'expense')
+VALID_CASH_FLOW_CATEGORIES = ('operating', 'investing', 'financing')
 
 def parse_tx_date(date_str: str) -> datetime:
     try:
@@ -614,6 +617,7 @@ def serialize_transaction(t: Transaction) -> dict:
         'merchant': t.merchant_name,
         'amount': float(t.amount),
         'transaction_type': t.transaction_type,
+        'cash_flow_category': t.cash_flow_category,
         'deduction_code': t.deduction_code,
         'category': t.category,
         'description': t.description,
@@ -641,6 +645,8 @@ async def create_bookkeeping_transaction(
 ):
     if payload.transaction_type not in VALID_TRANSACTION_TYPES:
         raise HTTPException(status_code=400, detail="transaction_type must be 'income' or 'expense'.")
+    if payload.cash_flow_category not in VALID_CASH_FLOW_CATEGORIES:
+        raise HTTPException(status_code=400, detail="cash_flow_category must be 'operating', 'investing', or 'financing'.")
 
     tx = Transaction(
         user_id=user_id,
@@ -648,6 +654,7 @@ async def create_bookkeeping_transaction(
         merchant_name=payload.merchant_name,
         amount=payload.amount,
         transaction_type=payload.transaction_type,
+        cash_flow_category=payload.cash_flow_category,
         deduction_code=payload.deduction_code,
         description=payload.description,
         category='manual',
@@ -682,6 +689,10 @@ async def update_bookkeeping_transaction(
         if payload.transaction_type not in VALID_TRANSACTION_TYPES:
             raise HTTPException(status_code=400, detail="transaction_type must be 'income' or 'expense'.")
         tx.transaction_type = payload.transaction_type
+    if payload.cash_flow_category is not None:
+        if payload.cash_flow_category not in VALID_CASH_FLOW_CATEGORIES:
+            raise HTTPException(status_code=400, detail="cash_flow_category must be 'operating', 'investing', or 'financing'.")
+        tx.cash_flow_category = payload.cash_flow_category
     if payload.deduction_code is not None:
         tx.deduction_code = payload.deduction_code
     if payload.description is not None:
@@ -742,12 +753,13 @@ async def export_bookkeeping_csv(
 
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(['Date', 'Merchant', 'Type', 'Category', 'Amount', 'Description'])
+    writer.writerow(['Date', 'Merchant', 'Type', 'Cash Flow Activity', 'Category', 'Amount', 'Description'])
     for t in txs:
         writer.writerow([
             t.transaction_date.strftime('%Y-%m-%d') if t.transaction_date else '',
             t.merchant_name,
             t.transaction_type,
+            t.cash_flow_category,
             t.deduction_code or t.category or '',
             float(t.amount),
             t.description or ''
@@ -828,6 +840,79 @@ async def export_profit_and_loss_csv(
     writer.writerow(['Net Income', f"{report['net_income']:.2f}"])
 
     filename = f"profit-and-loss-{year or 'all'}.csv"
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+# ============================================
+# CASH FLOW STATEMENT
+# Same ledger, same Depends(get_current_user_id) scoping as P&L. Every
+# transaction nets its cash effect (+amount if income, -amount if expense)
+# into whichever of the three activity sections it's tagged with
+# (cash_flow_category — defaults to 'operating', reclassified on the
+# transaction itself for asset purchases/sales or loan/equity/draw
+# activity). This reports net cash flow BY activity for the period, not a
+# beginning/ending bank balance — the app has no bank-balance data to
+# report one honestly.
+# ============================================
+
+def compute_cash_flow(user_id: int, year: int | None, db: Session) -> dict:
+    query = db.query(Transaction).filter(Transaction.user_id == user_id)
+    if year is not None:
+        query = query.filter(extract('year', Transaction.transaction_date) == year)
+    txs = query.all()
+
+    net_by_category = {c: Decimal(0) for c in VALID_CASH_FLOW_CATEGORIES}
+
+    for t in txs:
+        if t.transaction_type == 'income':
+            signed_amount = t.amount
+        elif t.transaction_type == 'expense':
+            signed_amount = -t.amount
+        else:
+            continue
+        category = t.cash_flow_category if t.cash_flow_category in VALID_CASH_FLOW_CATEGORIES else 'operating'
+        net_by_category[category] += signed_amount
+
+    net_change_in_cash = sum(net_by_category.values(), Decimal(0))
+
+    return {
+        'year': year,
+        'operating': float(net_by_category['operating']),
+        'investing': float(net_by_category['investing']),
+        'financing': float(net_by_category['financing']),
+        'net_change_in_cash': float(net_change_in_cash)
+    }
+
+@app.get("/api/reports/cash-flow")
+async def cash_flow(
+    year: int | None = None,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db)
+):
+    return compute_cash_flow(user_id, year, db)
+
+@app.get("/api/reports/cash-flow/export")
+async def export_cash_flow_csv(
+    year: int | None = None,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db)
+):
+    report = compute_cash_flow(user_id, year, db)
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([f"Cash Flow Statement — {year or 'All Years'}"])
+    writer.writerow([])
+    writer.writerow(['Net Cash from Operating Activities', f"{report['operating']:.2f}"])
+    writer.writerow(['Net Cash from Investing Activities', f"{report['investing']:.2f}"])
+    writer.writerow(['Net Cash from Financing Activities', f"{report['financing']:.2f}"])
+    writer.writerow([])
+    writer.writerow(['Net Change in Cash', f"{report['net_change_in_cash']:.2f}"])
+
+    filename = f"cash-flow-{year or 'all'}.csv"
     return StreamingResponse(
         iter([output.getvalue()]),
         media_type="text/csv",

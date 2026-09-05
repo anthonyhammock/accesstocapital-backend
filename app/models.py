@@ -93,6 +93,14 @@ class Transaction(Base):
     # row (CSV upload, questionnaire) already is.
     transaction_type = Column(String(20), nullable=False, default='expense')
 
+    # 'operating', 'investing', or 'financing' — the Cash Flow Statement's
+    # three activity sections. Defaults to 'operating' since that's what
+    # every existing row (day-to-day income/expenses) actually is; only
+    # asset purchases/sales (investing) and loan/equity/draw activity
+    # (financing) need reclassifying, which happens on the transaction
+    # itself rather than via a second parallel ledger.
+    cash_flow_category = Column(String(20), nullable=False, default='operating')
+
     deduction_code = Column(String(100), ForeignKey("deduction_rules.deduction_code"), nullable=True)
     category = Column(String(255), nullable=True)
     confidence_score = Column(Float, nullable=True)
