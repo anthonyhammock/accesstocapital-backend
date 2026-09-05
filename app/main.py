@@ -2,7 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import text, extract
+from sqlalchemy import text, extract, func
 from pydantic import BaseModel, Field
 from decimal import Decimal
 import csv
@@ -11,10 +11,15 @@ import json
 from datetime import datetime
 import os
 import re
+import secrets
+import urllib.parse
 import uuid
 
 from app.database import get_db, engine
-from app.models import Base, DeductionRule, CategorizationRule, Transaction, TaxSummary, User, ConsumerAccount, BusinessAccount
+from app.models import (
+    Base, DeductionRule, CategorizationRule, Transaction, TaxSummary, User,
+    ConsumerAccount, BusinessAccount, PortalClient, PortalDocument, PortalComment,
+)
 from app.auth import create_access_token, get_current_user_id
 import bcrypt
 
@@ -53,6 +58,14 @@ class AddBusinessRequest(BaseModel):
     ein: str = None
     business_type: str = None
     annual_revenue: Decimal = None
+
+class PortalClientCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    email: str | None = None
+    notes: str | None = None
+
+class PortalCommentCreate(BaseModel):
+    body: str = Field(min_length=1, max_length=5000)
 
 class TransactionInput(BaseModel):
     merchant_name: str
@@ -262,6 +275,10 @@ def categorize_merchant(merchant: str, db: Session) -> dict:
 ACCOUNTS_PER_BUREAU_SET = 3
 ADDITIONAL_BUSINESS_MONTHLY_FEE = Decimal('50.00')
 CONSUMER_MONTHLY_FEE = Decimal('10.00')
+
+# Cloud Run's default max request body is 32MB — stay well under that so a
+# large upload fails with our own clear 413, not a generic proxy error.
+MAX_PORTAL_FILE_SIZE = 15 * 1024 * 1024
 
 def mask_ein(ein: str | None) -> str | None:
     """Show only the last 4 digits — never return a full EIN over the API."""
@@ -996,6 +1013,324 @@ async def export_cash_flow_csv(
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
+
+# ============================================
+# CLIENT PORTAL & DOCUMENT COLLABORATION HUB
+# ============================================
+# Lets a business/consumer account holder ("owner") share documents with an
+# outside client who never signs up for an account — the client reaches
+# their own documents through an unguessable magic-link token instead of a
+# login. Everything under /api/portal/public/* is scoped ONLY by that
+# token; it must never accept a client_id, user_id, or document_id from the
+# caller without first checking it belongs to that token's client.
+
+def get_owned_client(client_id: int, user_id: int, db: Session) -> PortalClient:
+    client = db.query(PortalClient).filter(
+        PortalClient.id == client_id, PortalClient.user_id == user_id
+    ).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found.")
+    return client
+
+def get_owned_document(document_id: int, user_id: int, db: Session) -> PortalDocument:
+    doc = db.query(PortalDocument).filter(
+        PortalDocument.id == document_id, PortalDocument.user_id == user_id
+    ).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    return doc
+
+def get_active_client_by_token(token: str, db: Session) -> PortalClient:
+    client = db.query(PortalClient).filter(
+        PortalClient.portal_token == token, PortalClient.is_active == True
+    ).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="This portal link is invalid or has been revoked.")
+    return client
+
+def serialize_portal_document(doc: PortalDocument) -> dict:
+    return {
+        'id': doc.id,
+        'filename': doc.filename,
+        'content_type': doc.content_type,
+        'file_size': doc.file_size,
+        'uploaded_by': doc.uploaded_by,
+        'created_at': doc.created_at.isoformat() if doc.created_at else None,
+    }
+
+def serialize_portal_comment(comment: PortalComment) -> dict:
+    return {
+        'id': comment.id,
+        'author': comment.author,
+        'body': comment.body,
+        'created_at': comment.created_at.isoformat() if comment.created_at else None,
+    }
+
+def sanitize_portal_filename(filename: str) -> str:
+    """Strip control characters (including CR/LF, which could otherwise be
+    smuggled into the Content-Disposition header via a crafted upload) from
+    a client- or owner-supplied filename before it's stored or served."""
+    cleaned = re.sub(r'[\x00-\x1f\x7f]', '', filename).strip()
+    return cleaned or 'document'
+
+def content_disposition_attachment(filename: str) -> str:
+    """Build a Content-Disposition header value that's safe for any
+    filename. Header values are Latin-1 only, so a plain filename="..."
+    with e.g. CJK characters or an emoji raises UnicodeEncodeError at
+    response time — encode it as filename* per RFC 5987 instead, with an
+    ASCII-safe filename= as a fallback for older clients."""
+    ascii_fallback = filename.encode('ascii', 'replace').decode('ascii').replace('?', '_')
+    encoded = urllib.parse.quote(filename, safe='')
+    return f'attachment; filename="{ascii_fallback}"; filename*=UTF-8\'\'{encoded}'
+
+async def read_portal_upload(file: UploadFile) -> bytes:
+    contents = await file.read()
+    if len(contents) == 0:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    if len(contents) > MAX_PORTAL_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large — max {MAX_PORTAL_FILE_SIZE // (1024 * 1024)}MB."
+        )
+    return contents
+
+def portal_download_response(doc: PortalDocument) -> StreamingResponse:
+    # Always served as an attachment — a browser never renders an uploaded
+    # file inline under our origin, which would let a malicious HTML/SVG
+    # upload run script against a signed-in owner's or client's session.
+    return StreamingResponse(
+        iter([doc.file_data]),
+        media_type=doc.content_type or 'application/octet-stream',
+        headers={"Content-Disposition": content_disposition_attachment(doc.filename)}
+    )
+
+# --- Owner-authenticated endpoints ---
+
+@app.post("/api/portal/clients")
+async def create_portal_client(
+    payload: PortalClientCreate,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db)
+):
+    client = PortalClient(
+        user_id=user_id,
+        name=payload.name,
+        email=payload.email,
+        notes=payload.notes,
+        portal_token=secrets.token_urlsafe(32),
+    )
+    db.add(client)
+    db.commit()
+    db.refresh(client)
+    return {
+        'id': client.id,
+        'name': client.name,
+        'email': client.email,
+        'notes': client.notes,
+        'portal_token': client.portal_token,
+        'is_active': client.is_active,
+        'created_at': client.created_at.isoformat(),
+        'document_count': 0,
+    }
+
+@app.get("/api/portal/clients")
+async def list_portal_clients(user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    clients = db.query(PortalClient).filter(
+        PortalClient.user_id == user_id
+    ).order_by(PortalClient.created_at.desc()).all()
+
+    counts = dict(
+        db.query(PortalDocument.client_id, func.count(PortalDocument.id))
+        .filter(PortalDocument.user_id == user_id)
+        .group_by(PortalDocument.client_id)
+        .all()
+    )
+
+    return {
+        'clients': [
+            {
+                'id': c.id,
+                'name': c.name,
+                'email': c.email,
+                'notes': c.notes,
+                'portal_token': c.portal_token,
+                'is_active': c.is_active,
+                'created_at': c.created_at.isoformat() if c.created_at else None,
+                'document_count': counts.get(c.id, 0),
+            }
+            for c in clients
+        ]
+    }
+
+@app.get("/api/portal/clients/{client_id}")
+async def get_portal_client(client_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    client = get_owned_client(client_id, user_id, db)
+    documents = db.query(PortalDocument).filter(
+        PortalDocument.client_id == client.id, PortalDocument.user_id == user_id
+    ).order_by(PortalDocument.created_at.desc()).all()
+
+    return {
+        'id': client.id,
+        'name': client.name,
+        'email': client.email,
+        'notes': client.notes,
+        'portal_token': client.portal_token,
+        'is_active': client.is_active,
+        'created_at': client.created_at.isoformat() if client.created_at else None,
+        'documents': [serialize_portal_document(d) for d in documents],
+    }
+
+@app.post("/api/portal/clients/{client_id}/regenerate-link")
+async def regenerate_portal_link(client_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    """Invalidate the old magic link and issue a new one — e.g. if the old
+    link was shared with the wrong person by mistake."""
+    client = get_owned_client(client_id, user_id, db)
+    client.portal_token = secrets.token_urlsafe(32)
+    db.commit()
+    return {'status': 'success', 'portal_token': client.portal_token}
+
+@app.post("/api/portal/clients/{client_id}/revoke")
+async def revoke_portal_client(client_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    """Disable the portal link without deleting the client's document history."""
+    client = get_owned_client(client_id, user_id, db)
+    client.is_active = False
+    db.commit()
+    return {'status': 'success'}
+
+@app.post("/api/portal/clients/{client_id}/reactivate")
+async def reactivate_portal_client(client_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    client = get_owned_client(client_id, user_id, db)
+    client.is_active = True
+    db.commit()
+    return {'status': 'success'}
+
+@app.post("/api/portal/clients/{client_id}/documents")
+async def upload_portal_document_as_owner(
+    client_id: int,
+    file: UploadFile = File(...),
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db)
+):
+    client = get_owned_client(client_id, user_id, db)
+    contents = await read_portal_upload(file)
+
+    doc = PortalDocument(
+        user_id=user_id,
+        client_id=client.id,
+        filename=sanitize_portal_filename(file.filename or 'document'),
+        content_type=file.content_type,
+        file_size=len(contents),
+        file_data=contents,
+        uploaded_by='owner',
+    )
+    db.add(doc)
+    db.commit()
+    db.refresh(doc)
+    return serialize_portal_document(doc)
+
+@app.get("/api/portal/documents/{document_id}/download")
+async def download_portal_document_as_owner(document_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    doc = get_owned_document(document_id, user_id, db)
+    return portal_download_response(doc)
+
+@app.delete("/api/portal/documents/{document_id}")
+async def delete_portal_document(document_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    doc = get_owned_document(document_id, user_id, db)
+    db.query(PortalComment).filter(PortalComment.document_id == doc.id).delete()
+    db.delete(doc)
+    db.commit()
+    return {'status': 'success'}
+
+@app.get("/api/portal/documents/{document_id}/comments")
+async def list_portal_comments_as_owner(document_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    doc = get_owned_document(document_id, user_id, db)
+    comments = db.query(PortalComment).filter(
+        PortalComment.document_id == doc.id
+    ).order_by(PortalComment.created_at.asc()).all()
+    return {'comments': [serialize_portal_comment(c) for c in comments]}
+
+@app.post("/api/portal/documents/{document_id}/comments")
+async def add_portal_comment_as_owner(
+    document_id: int,
+    payload: PortalCommentCreate,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db)
+):
+    doc = get_owned_document(document_id, user_id, db)
+    comment = PortalComment(document_id=doc.id, author='owner', body=payload.body)
+    db.add(comment)
+    db.commit()
+    db.refresh(comment)
+    return serialize_portal_comment(comment)
+
+# --- Public, token-scoped endpoints (no login) ---
+
+@app.get("/api/portal/public/{token}")
+async def get_public_portal(token: str, db: Session = Depends(get_db)):
+    client = get_active_client_by_token(token, db)
+    documents = db.query(PortalDocument).filter(PortalDocument.client_id == client.id).order_by(
+        PortalDocument.created_at.desc()
+    ).all()
+    return {
+        'client_name': client.name,
+        'documents': [serialize_portal_document(d) for d in documents],
+    }
+
+@app.get("/api/portal/public/{token}/documents/{document_id}/download")
+async def download_public_portal_document(token: str, document_id: int, db: Session = Depends(get_db)):
+    client = get_active_client_by_token(token, db)
+    doc = db.query(PortalDocument).filter(
+        PortalDocument.id == document_id, PortalDocument.client_id == client.id
+    ).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    return portal_download_response(doc)
+
+@app.post("/api/portal/public/{token}/documents")
+async def upload_public_portal_document(token: str, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    client = get_active_client_by_token(token, db)
+    contents = await read_portal_upload(file)
+
+    doc = PortalDocument(
+        user_id=client.user_id,
+        client_id=client.id,
+        filename=sanitize_portal_filename(file.filename or 'document'),
+        content_type=file.content_type,
+        file_size=len(contents),
+        file_data=contents,
+        uploaded_by='client',
+    )
+    db.add(doc)
+    db.commit()
+    db.refresh(doc)
+    return serialize_portal_document(doc)
+
+@app.get("/api/portal/public/{token}/documents/{document_id}/comments")
+async def list_public_portal_comments(token: str, document_id: int, db: Session = Depends(get_db)):
+    client = get_active_client_by_token(token, db)
+    doc = db.query(PortalDocument).filter(
+        PortalDocument.id == document_id, PortalDocument.client_id == client.id
+    ).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    comments = db.query(PortalComment).filter(
+        PortalComment.document_id == doc.id
+    ).order_by(PortalComment.created_at.asc()).all()
+    return {'comments': [serialize_portal_comment(c) for c in comments]}
+
+@app.post("/api/portal/public/{token}/documents/{document_id}/comments")
+async def add_public_portal_comment(token: str, document_id: int, payload: PortalCommentCreate, db: Session = Depends(get_db)):
+    client = get_active_client_by_token(token, db)
+    doc = db.query(PortalDocument).filter(
+        PortalDocument.id == document_id, PortalDocument.client_id == client.id
+    ).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    comment = PortalComment(document_id=doc.id, author='client', body=payload.body)
+    db.add(comment)
+    db.commit()
+    db.refresh(comment)
+    return serialize_portal_comment(comment)
 
 # ============================================
 # HEALTH

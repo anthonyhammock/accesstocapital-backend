@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Numeric, Boolean, Text, ForeignKey, Float, JSON
+from sqlalchemy import Column, Integer, String, DateTime, Numeric, Boolean, Text, ForeignKey, Float, JSON, LargeBinary
 from sqlalchemy.orm import declarative_base
 from datetime import datetime
 
@@ -106,6 +106,49 @@ class Transaction(Base):
     confidence_score = Column(Float, nullable=True)
 
     bank_csv_source = Column(String(100), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class PortalClient(Base):
+    __tablename__ = "portal_clients"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    email = Column(String(255), nullable=True)
+    notes = Column(Text, nullable=True)
+
+    # Unguessable magic-link token (secrets.token_urlsafe(32)) — this is the
+    # only thing that gates the public /api/portal/public/* endpoints, so it
+    # must never be derivable from the client id or any other public value.
+    portal_token = Column(String(64), unique=True, index=True, nullable=False)
+    is_active = Column(Boolean, default=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class PortalDocument(Base):
+    __tablename__ = "portal_documents"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    client_id = Column(Integer, ForeignKey("portal_clients.id"), nullable=False, index=True)
+    filename = Column(String(255), nullable=False)
+    content_type = Column(String(255), nullable=True)
+    file_size = Column(Integer, nullable=False)
+    file_data = Column(LargeBinary, nullable=False)
+
+    # 'owner' or 'client' — who uploaded it, shown in the UI so each side can
+    # tell a document they sent apart from one they received.
+    uploaded_by = Column(String(20), nullable=False)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class PortalComment(Base):
+    __tablename__ = "portal_comments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    document_id = Column(Integer, ForeignKey("portal_documents.id"), nullable=False, index=True)
+    author = Column(String(20), nullable=False)  # 'owner' or 'client'
+    body = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class TaxSummary(Base):
