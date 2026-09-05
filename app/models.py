@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Numeric, Boolean, Text, ForeignKey, Float, JSON, LargeBinary
+from sqlalchemy import Column, Integer, String, DateTime, Numeric, Boolean, Text, ForeignKey, Float, JSON, LargeBinary, Time
 from sqlalchemy.orm import declarative_base
 from datetime import datetime
 
@@ -149,6 +149,63 @@ class PortalComment(Base):
     document_id = Column(Integer, ForeignKey("portal_documents.id"), nullable=False, index=True)
     author = Column(String(20), nullable=False)  # 'owner' or 'client'
     body = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class SchedulingSettings(Base):
+    __tablename__ = "scheduling_settings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, unique=True, index=True)
+
+    # IANA name (e.g. "America/New_York") — every weekly AvailabilityRule
+    # time and every computed public slot is interpreted in this zone, then
+    # converted to/from UTC for storage and for the visitor's own browser.
+    timezone = Column(String(64), nullable=False, default="UTC")
+
+    meeting_duration_minutes = Column(Integer, nullable=False, default=30)
+    buffer_minutes = Column(Integer, nullable=False, default=0)
+
+    # No one can book a slot starting sooner than this many hours from now —
+    # keeps a booking from landing on the owner's calendar with zero warning.
+    min_notice_hours = Column(Integer, nullable=False, default=2)
+
+    # Unguessable-enough public slug (not a secret like the portal token —
+    # meant to be shared openly, like a Calendly link).
+    booking_slug = Column(String(64), unique=True, index=True, nullable=False)
+    is_active = Column(Boolean, default=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class AvailabilityRule(Base):
+    __tablename__ = "availability_rules"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+
+    # Python's date.weekday() convention: 0 = Monday ... 6 = Sunday.
+    day_of_week = Column(Integer, nullable=False)
+    start_time = Column(Time, nullable=False)
+    end_time = Column(Time, nullable=False)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class Booking(Base):
+    __tablename__ = "bookings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+
+    guest_name = Column(String(255), nullable=False)
+    guest_email = Column(String(255), nullable=False)
+    notes = Column(Text, nullable=True)
+
+    # Always UTC — the one unambiguous instant both sides agree on. The
+    # owner's and guest's local displays are computed from this, not stored.
+    start_at = Column(DateTime, nullable=False, index=True)
+    end_at = Column(DateTime, nullable=False)
+
+    status = Column(String(20), nullable=False, default='confirmed')  # 'confirmed' or 'cancelled'
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class TaxSummary(Base):

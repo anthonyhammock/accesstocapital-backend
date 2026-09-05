@@ -3,12 +3,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import text, extract, func
+from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel, Field
 from decimal import Decimal
 import csv
 import io
 import json
-from datetime import datetime
+from datetime import datetime, timezone, timedelta, time as time_type
+from zoneinfo import ZoneInfo, available_timezones
 import os
 import re
 import secrets
@@ -19,6 +21,7 @@ from app.database import get_db, engine
 from app.models import (
     Base, DeductionRule, CategorizationRule, Transaction, TaxSummary, User,
     ConsumerAccount, BusinessAccount, PortalClient, PortalDocument, PortalComment,
+    SchedulingSettings, AvailabilityRule, Booking,
 )
 from app.auth import create_access_token, get_current_user_id
 import bcrypt
@@ -66,6 +69,27 @@ class PortalClientCreate(BaseModel):
 
 class PortalCommentCreate(BaseModel):
     body: str = Field(min_length=1, max_length=5000)
+
+class SchedulingSettingsUpdate(BaseModel):
+    timezone: str
+    meeting_duration_minutes: int = Field(gt=0, le=480)
+    buffer_minutes: int = Field(ge=0, le=120)
+    min_notice_hours: int = Field(ge=0, le=336)
+    is_active: bool = True
+
+class AvailabilityRuleInput(BaseModel):
+    day_of_week: int = Field(ge=0, le=6)
+    start_time: str
+    end_time: str
+
+class AvailabilityRulesUpdate(BaseModel):
+    rules: list[AvailabilityRuleInput]
+
+class BookingCreate(BaseModel):
+    start_at: str
+    guest_name: str = Field(min_length=1, max_length=255)
+    guest_email: str = Field(min_length=3, max_length=255)
+    notes: str | None = Field(default=None, max_length=2000)
 
 class TransactionInput(BaseModel):
     merchant_name: str
@@ -1331,6 +1355,293 @@ async def add_public_portal_comment(token: str, document_id: int, payload: Porta
     db.commit()
     db.refresh(comment)
     return serialize_portal_comment(comment)
+
+# ============================================
+# SCHEDULING & BOOKING LINKS
+# ============================================
+# Lets an account holder ("owner") publish weekly availability and get a
+# public booking link — a visitor picks a real open slot and books it with
+# no account of their own, the same no-login pattern as the Client Portal.
+# Everything is stored in UTC; the owner's stored timezone converts their
+# weekly rules into concrete slots, and the guest's browser converts those
+# UTC instants into their own local time for display.
+
+MAX_BOOKING_WINDOW_DAYS = 21
+
+def generate_booking_slug(user: User) -> str:
+    base = re.sub(r'[^a-z0-9]+', '-', f"{user.first_name}-{user.last_name}".lower()).strip('-') or 'book'
+    suffix = secrets.token_hex(3)
+    return f"{base}-{suffix}"[:64]
+
+def get_unique_booking_slug(user: User, db: Session) -> str:
+    for _ in range(5):
+        slug = generate_booking_slug(user)
+        if not db.query(SchedulingSettings).filter(SchedulingSettings.booking_slug == slug).first():
+            return slug
+    return secrets.token_hex(8)
+
+def get_or_create_scheduling_settings(user_id: int, db: Session) -> SchedulingSettings:
+    settings = db.query(SchedulingSettings).filter(SchedulingSettings.user_id == user_id).first()
+    if settings:
+        return settings
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    settings = SchedulingSettings(user_id=user_id, booking_slug=get_unique_booking_slug(user, db))
+    db.add(settings)
+    try:
+        db.commit()
+    except IntegrityError:
+        # Two concurrent first-time requests (e.g. a double-click, or two
+        # tabs loading settings at once) can both reach here and both try to
+        # insert — the unique constraint on user_id rejects the loser. That's
+        # not an error case, it just means the winner's row is the answer.
+        db.rollback()
+        settings = db.query(SchedulingSettings).filter(SchedulingSettings.user_id == user_id).first()
+        if not settings:
+            raise
+        return settings
+    db.refresh(settings)
+    return settings
+
+def parse_hhmm(value: str) -> time_type:
+    try:
+        hour_str, minute_str = value.split(':')
+        return time_type(int(hour_str), int(minute_str))
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail=f"Invalid time '{value}' — expected HH:MM.")
+
+def serialize_settings(settings: SchedulingSettings, rules: list) -> dict:
+    return {
+        'timezone': settings.timezone,
+        'meeting_duration_minutes': settings.meeting_duration_minutes,
+        'buffer_minutes': settings.buffer_minutes,
+        'min_notice_hours': settings.min_notice_hours,
+        'booking_slug': settings.booking_slug,
+        'is_active': settings.is_active,
+        'availability': [
+            {'day_of_week': r.day_of_week, 'start_time': r.start_time.strftime('%H:%M'), 'end_time': r.end_time.strftime('%H:%M')}
+            for r in rules
+        ],
+    }
+
+def serialize_booking(b: Booking) -> dict:
+    return {
+        'id': b.id,
+        'guest_name': b.guest_name,
+        'guest_email': b.guest_email,
+        'notes': b.notes,
+        'start_at': b.start_at.replace(tzinfo=timezone.utc).isoformat(),
+        'end_at': b.end_at.replace(tzinfo=timezone.utc).isoformat(),
+        'status': b.status,
+        'created_at': b.created_at.isoformat() if b.created_at else None,
+    }
+
+def compute_available_slots(settings: SchedulingSettings, db: Session) -> list[dict]:
+    """Weekly availability rules (in the owner's timezone) minus existing
+    confirmed bookings and the minimum-notice window, projected forward
+    MAX_BOOKING_WINDOW_DAYS days. Returns UTC instants."""
+    try:
+        tz = ZoneInfo(settings.timezone)
+    except Exception:
+        tz = ZoneInfo('UTC')
+
+    rules = db.query(AvailabilityRule).filter(AvailabilityRule.user_id == settings.user_id).all()
+    rules_by_day = {}
+    for r in rules:
+        rules_by_day.setdefault(r.day_of_week, []).append(r)
+
+    now_utc = datetime.now(timezone.utc)
+    earliest_bookable = now_utc + timedelta(hours=settings.min_notice_hours)
+    window_end = now_utc + timedelta(days=MAX_BOOKING_WINDOW_DAYS)
+
+    existing = db.query(Booking).filter(
+        Booking.user_id == settings.user_id,
+        Booking.status == 'confirmed',
+        Booking.end_at >= now_utc.replace(tzinfo=None),
+    ).all()
+    existing_intervals = [
+        (b.start_at.replace(tzinfo=timezone.utc), b.end_at.replace(tzinfo=timezone.utc))
+        for b in existing
+    ]
+
+    duration = timedelta(minutes=settings.meeting_duration_minutes)
+    step = timedelta(minutes=settings.meeting_duration_minutes + settings.buffer_minutes)
+
+    slots = []
+    today_local = now_utc.astimezone(tz).date()
+    for day_offset in range(MAX_BOOKING_WINDOW_DAYS):
+        day_local = today_local + timedelta(days=day_offset)
+        for rule in rules_by_day.get(day_local.weekday(), []):
+            slot_start_local = datetime.combine(day_local, rule.start_time, tzinfo=tz)
+            day_end_local = datetime.combine(day_local, rule.end_time, tzinfo=tz)
+
+            while slot_start_local + duration <= day_end_local:
+                slot_start_utc = slot_start_local.astimezone(timezone.utc)
+
+                # A wall-clock time that doesn't exist (the "spring forward"
+                # DST gap, e.g. 2:30 AM on the day US clocks skip from 2 to
+                # 3) still constructs without error — Python silently
+                # resolves it using the pre-transition offset. Round-tripping
+                # back to local time exposes that mismatch so we can skip
+                # it, instead of offering a slot an hour off from what the
+                # owner's own calendar would show.
+                if slot_start_utc.astimezone(tz).replace(tzinfo=None) != slot_start_local.replace(tzinfo=None):
+                    slot_start_local += step
+                    continue
+
+                slot_end_utc = slot_start_utc + duration
+                if earliest_bookable <= slot_start_utc <= window_end:
+                    overlaps = any(slot_start_utc < be and slot_end_utc > bs for bs, be in existing_intervals)
+                    if not overlaps:
+                        slots.append({'start_at': slot_start_utc.isoformat(), 'end_at': slot_end_utc.isoformat()})
+
+                slot_start_local += step
+
+    slots.sort(key=lambda s: s['start_at'])
+    return slots
+
+# --- Owner-authenticated endpoints ---
+
+@app.get("/api/scheduling/settings")
+async def get_scheduling_settings_endpoint(user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    settings = get_or_create_scheduling_settings(user_id, db)
+    rules = db.query(AvailabilityRule).filter(AvailabilityRule.user_id == user_id).order_by(
+        AvailabilityRule.day_of_week, AvailabilityRule.start_time
+    ).all()
+    return serialize_settings(settings, rules)
+
+@app.put("/api/scheduling/settings")
+async def update_scheduling_settings(
+    payload: SchedulingSettingsUpdate,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db)
+):
+    if payload.timezone not in available_timezones():
+        raise HTTPException(status_code=400, detail="Unrecognized timezone.")
+
+    settings = get_or_create_scheduling_settings(user_id, db)
+    settings.timezone = payload.timezone
+    settings.meeting_duration_minutes = payload.meeting_duration_minutes
+    settings.buffer_minutes = payload.buffer_minutes
+    settings.min_notice_hours = payload.min_notice_hours
+    settings.is_active = payload.is_active
+    db.commit()
+
+    rules = db.query(AvailabilityRule).filter(AvailabilityRule.user_id == user_id).order_by(
+        AvailabilityRule.day_of_week, AvailabilityRule.start_time
+    ).all()
+    return serialize_settings(settings, rules)
+
+@app.post("/api/scheduling/settings/regenerate-link")
+async def regenerate_booking_link(user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    settings = get_or_create_scheduling_settings(user_id, db)
+    user = db.query(User).filter(User.id == user_id).first()
+    settings.booking_slug = get_unique_booking_slug(user, db)
+    db.commit()
+    return {'status': 'success', 'booking_slug': settings.booking_slug}
+
+@app.put("/api/scheduling/availability")
+async def set_availability(
+    payload: AvailabilityRulesUpdate,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db)
+):
+    parsed = []
+    for r in payload.rules:
+        start = parse_hhmm(r.start_time)
+        end = parse_hhmm(r.end_time)
+        if start >= end:
+            raise HTTPException(status_code=400, detail="Each day's start time must be before its end time.")
+        parsed.append((r.day_of_week, start, end))
+
+    get_or_create_scheduling_settings(user_id, db)  # ensure settings row exists
+    db.query(AvailabilityRule).filter(AvailabilityRule.user_id == user_id).delete()
+    for day_of_week, start, end in parsed:
+        db.add(AvailabilityRule(user_id=user_id, day_of_week=day_of_week, start_time=start, end_time=end))
+    db.commit()
+    return {'status': 'success'}
+
+@app.get("/api/scheduling/bookings")
+async def list_scheduling_bookings(
+    include_past: bool = False,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db)
+):
+    query = db.query(Booking).filter(Booking.user_id == user_id, Booking.status == 'confirmed')
+    if not include_past:
+        query = query.filter(Booking.end_at >= datetime.utcnow())
+    bookings = query.order_by(Booking.start_at.asc()).all()
+    return {'bookings': [serialize_booking(b) for b in bookings]}
+
+@app.post("/api/scheduling/bookings/{booking_id}/cancel")
+async def cancel_scheduling_booking(booking_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    booking = db.query(Booking).filter(Booking.id == booking_id, Booking.user_id == user_id).first()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found.")
+    booking.status = 'cancelled'
+    db.commit()
+    return {'status': 'success'}
+
+# --- Public, slug-scoped endpoints (no login) ---
+
+@app.get("/api/scheduling/public/{slug}")
+async def get_public_scheduling_page(slug: str, db: Session = Depends(get_db)):
+    settings = db.query(SchedulingSettings).filter(
+        SchedulingSettings.booking_slug == slug, SchedulingSettings.is_active == True
+    ).first()
+    if not settings:
+        raise HTTPException(status_code=404, detail="This booking link is invalid or has been disabled.")
+
+    user = db.query(User).filter(User.id == settings.user_id).first()
+    owner_name = ' '.join(p for p in [user.first_name, user.last_name] if p) if user else ''
+    owner_name = owner_name or 'BlissPoint Access'
+
+    return {
+        'owner_name': owner_name,
+        'timezone': settings.timezone,
+        'meeting_duration_minutes': settings.meeting_duration_minutes,
+        'slots': compute_available_slots(settings, db),
+    }
+
+@app.post("/api/scheduling/public/{slug}/book")
+async def book_public_slot(slug: str, payload: BookingCreate, db: Session = Depends(get_db)):
+    # Locks the settings row for the duration of this transaction so two
+    # concurrent booking requests for the same owner can't both pass the
+    # availability check for the same slot — the second one blocks until
+    # the first commits, then re-checks and correctly sees it's taken.
+    settings = db.query(SchedulingSettings).filter(
+        SchedulingSettings.booking_slug == slug, SchedulingSettings.is_active == True
+    ).with_for_update().first()
+    if not settings:
+        raise HTTPException(status_code=404, detail="This booking link is invalid or has been disabled.")
+
+    try:
+        start_at = datetime.fromisoformat(payload.start_at.replace('Z', '+00:00'))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid start time.")
+    if start_at.tzinfo is None:
+        raise HTTPException(status_code=400, detail="start_at must include a timezone offset.")
+
+    start_at_utc = start_at.astimezone(timezone.utc)
+    end_at_utc = start_at_utc + timedelta(minutes=settings.meeting_duration_minutes)
+
+    valid_starts = {slot['start_at'] for slot in compute_available_slots(settings, db)}
+    if start_at_utc.isoformat() not in valid_starts:
+        raise HTTPException(status_code=409, detail="That time is no longer available. Please choose another.")
+
+    booking = Booking(
+        user_id=settings.user_id,
+        guest_name=payload.guest_name,
+        guest_email=payload.guest_email,
+        notes=payload.notes,
+        start_at=start_at_utc.replace(tzinfo=None),
+        end_at=end_at_utc.replace(tzinfo=None),
+    )
+    db.add(booking)
+    db.commit()
+    db.refresh(booking)
+    return serialize_booking(booking)
 
 # ============================================
 # HEALTH
