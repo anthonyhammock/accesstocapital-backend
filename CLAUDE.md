@@ -18,3 +18,9 @@
   Never replace whole files — it has silently deleted working code
   (auth endpoints, model classes) in this project before.
 - Always actually run/test code changes before calling a task complete.
+- Product philosophy: every tool on the platform should be professional
+  grade — competitive with the best dedicated, single-purpose tool in its
+  category, not a stripped-down "good enough" version. Favor the features
+  that are popular, in high demand, and that work efficiently over
+  exhaustive feature parity; strip away anything unnecessary rather than
+  bolting it on.

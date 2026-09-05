@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Numeric, Boolean, Text, ForeignKey, Float, JSON, LargeBinary, Time
+from sqlalchemy import Column, Integer, String, DateTime, Numeric, Boolean, Text, ForeignKey, Float, JSON, LargeBinary, Time, UniqueConstraint
 from sqlalchemy.orm import declarative_base
 from datetime import datetime
 
@@ -358,6 +358,65 @@ class BillPayment(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     bill_id = Column(Integer, ForeignKey("bills.id"), nullable=False, index=True)
+    amount = Column(Numeric(14, 2), nullable=False)
+    payment_date = Column(DateTime, nullable=False)
+    payment_method = Column(String(20), nullable=False, default='other')  # check/ach/card/wire/cash/other
+    reference_number = Column(String(100), nullable=True)
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class Invoice(Base):
+    __tablename__ = "invoices"
+    # Backstop against next_invoice_number() ever handing out a number a
+    # user already has (e.g. a race between two concurrent creates) — a
+    # duplicate, customer-facing invoice number is a real data-integrity
+    # problem, not just a cosmetic one, so this fails loudly instead of
+    # silently allowing it.
+    __table_args__ = (UniqueConstraint('user_id', 'invoice_number', name='uq_invoices_user_invoice_number'),)
+
+    # Reuses PortalClient as the customer record rather than a separate
+    # Customer model — one client list shared across Client Portal and
+    # Invoicing instead of two parallel, easily-out-of-sync ones.
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    client_id = Column(Integer, ForeignKey("portal_clients.id"), nullable=False, index=True)
+
+    # Assigned once at creation (e.g. "INV-1001") and never recomputed —
+    # unlike a bill's status, this is an identity, not a derived value.
+    invoice_number = Column(String(20), nullable=False)
+
+    issue_date = Column(DateTime, nullable=False)
+    due_date = Column(DateTime, nullable=False, index=True)
+    tax_rate = Column(Numeric(5, 2), nullable=False, default=0)  # percent, applied to the line-item subtotal
+    notes = Column(Text, nullable=True)
+
+    # NULL = draft (not yet sent to the client); set = sent. Status beyond
+    # that (paid/overdue/partial) is always derived from payments + due_date,
+    # same "derive, don't cache" discipline as Bill.status in Vendor & AP.
+    sent_at = Column(DateTime, nullable=True)
+
+    # Unguessable public link so the client can view (not edit) this one
+    # invoice without an account — same pattern as PortalClient.portal_token.
+    public_token = Column(String(64), unique=True, index=True, nullable=False)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class InvoiceLineItem(Base):
+    __tablename__ = "invoice_line_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    invoice_id = Column(Integer, ForeignKey("invoices.id"), nullable=False, index=True)
+    description = Column(Text, nullable=False)
+    quantity = Column(Numeric(10, 2), nullable=False, default=1)
+    unit_price = Column(Numeric(12, 2), nullable=False)
+    sort_order = Column(Integer, nullable=False, default=0)
+
+class InvoicePayment(Base):
+    __tablename__ = "invoice_payments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    invoice_id = Column(Integer, ForeignKey("invoices.id"), nullable=False, index=True)
     amount = Column(Numeric(14, 2), nullable=False)
     payment_date = Column(DateTime, nullable=False)
     payment_method = Column(String(20), nullable=False, default='other')  # check/ach/card/wire/cash/other
