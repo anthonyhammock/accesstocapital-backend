@@ -17,6 +17,20 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     is_active = Column(Boolean, default=True)
 
+    # No self-service path to either of these — set directly in the DB by
+    # the platform owner. is_admin gates every /api/admin/* endpoint;
+    # is_comped just marks an account as free/test access for the owner's
+    # own tracking (and, once real billing exists, to exclude it from
+    # charges) — the two are independent (an admin isn't automatically
+    # comped, a comped user isn't automatically an admin).
+    #
+    # default=False here is Python-side only (SQLAlchemy applies it on
+    # INSERT, not to existing rows) — any manual ALTER TABLE against the
+    # already-populated production `users` table MUST include an explicit
+    # DEFAULT FALSE, or Postgres will reject a NOT NULL column add outright.
+    is_admin = Column(Boolean, nullable=False, default=False)
+    is_comped = Column(Boolean, nullable=False, default=False)
+
 class ConsumerAccount(Base):
     __tablename__ = "consumer_accounts"
 
