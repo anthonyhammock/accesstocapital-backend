@@ -169,7 +169,6 @@ async def list_vendors(include_inactive: bool = False, user_id: int = Depends(ge
     vendor_ids = [v.id for v in vendors]
     bills = db.query(Bill).filter(Bill.vendor_id.in_(vendor_ids)).all() if vendor_ids else []
     paid_totals = paid_totals_by_bill([b.id for b in bills], db)
-    now = datetime.utcnow()
 
     balance_by_vendor: dict[int, Decimal] = {}
     for b in bills:
@@ -317,6 +316,11 @@ async def record_payment(bill_id: int, payload: PaymentCreate, user_id: int = De
     if payload.payment_method not in VALID_PAYMENT_METHODS:
         raise HTTPException(status_code=400, detail=f"payment_method must be one of {sorted(VALID_PAYMENT_METHODS)}")
 
+    # Read-then-check-then-insert, not row-locked — two concurrent payments
+    # against the same bill could theoretically both pass this check before
+    # either commits. Accepted for now since this is a single owner manually
+    # keying in payments through this UI; revisit with a row lock or a DB
+    # CHECK constraint if this ever gets a public API or multi-user access.
     existing_paid = db.query(func.coalesce(func.sum(BillPayment.amount), 0)).filter(BillPayment.bill_id == bill.id).scalar()
     existing_paid = Decimal(existing_paid)
     remaining = bill.amount - existing_paid
